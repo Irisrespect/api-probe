@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-API 中转站测活工具 (API Probe)  v1.3.0
+API 中转站测活工具 (API Probe)  v1.4.0
 =====================================================================
 单文件、零第三方依赖的 Windows 桌面小工具（Python 3.9+，自带 tkinter 即可运行）
 
@@ -11,8 +11,19 @@ API 中转站测活工具 (API Probe)  v1.3.0
       ＋ 添加站点   填名称 + 地址（可用常用预设快速填充）+ Key + 默认模型
       编辑 / 删除   对当前选中的站点操作
       ✎ 自定义（临时）  内置的一格，不参与站点列表，但同样记住你敲进去的内容
-    切换站点会自动带出该站的地址与 Key；正在编辑的内容会先存回原来那一格，
-    所以「切到 Kimi 再切回自定义」不会丢东西。加完站点还能一键导入批量列表做巡检。
+    切换站点会自动带出该站的地址与 Key；正在编辑的内容会先存回原来那一格。
+    加完站点还能一键导入批量列表做巡检。
+
+Claude Code 一键接入（v1.4 新增）
+--------------------------------
+    Claude Code CLI 2.x 支持直连第三方网关，本工具把「检测 → 配置 → 验证」串成一步：
+      ① 检测 /v1/messages   依次试 Authorization: Bearer 与 x-api-key，
+                            并补一次流式测试（CLI 全程走流式）
+      ② 模型映射            sonnet/opus/haiku/fable 别名 → 网关真实模型 id（不做映射必 404）
+      ③ 一键接入            可多选：写 ~/.claude/settings.json（合并 + 自动备份）/
+                            生成启动脚本（不落盘 Key）/ 生成隔离配置目录（CLAUDE_CONFIG_DIR）
+      ④ 端到端验证          在空的隔离配置目录里跑 claude -p PONG，证明整条链路真的通
+    前提：CLI 需 2.x；网关必须实现 Anthropic Messages 协议（只提供 OpenAI 协议的站无法直连）。
 
 工作流程（两段式，中间由你决定测哪个模型）
 ------------------------------------------
@@ -39,6 +50,7 @@ API 中转站测活工具 (API Probe)  v1.3.0
 5. 掺水鉴别：请求模型 vs 返回模型比对、异常低延迟、usage 缺失、模型不在列表等信号
 6. 站点指纹：探测 /api/status 与首页 title，识别是否 New API / one-api / Veloera 系面板
 7. 批量测试多站（可一键从站点列表导入）+ 导出 CSV / JSON
+8. Claude Code 一键接入：通道检测 → 模型映射 → 写配置/启动脚本 → 端到端验证
 
 用法
 ----
@@ -46,8 +58,9 @@ API 中转站测活工具 (API Probe)  v1.3.0
     python api_probe.py --url URL --key KEY --list-only          # 只做第 ① 步，列出模型
     python api_probe.py --url URL --key KEY --model M            # 指定模型直接做第 ② 步
     python api_probe.py --url URL --key KEY --json               # 一次性两步，JSON 输出
+    python api_probe.py --url URL --key KEY --claude-check       # 检测能否接 Claude Code
     python api_probe.py --selftest               # 核心逻辑自检（本地 mock，不访问外网）
-    python api_probe.py --uitest                 # 界面 + 站点管理 + 两段式流程自检
+    python api_probe.py --uitest                 # 界面 + 站点管理 + 两段式 + 接入页自检
 
 作者说明：本工具只做「客户端主动探测」，不代理、不存储任何请求内容。
 """
@@ -62,9 +75,12 @@ import json
 import os
 import queue
 import re
+import shutil
 import socket
 import ssl
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -74,7 +90,7 @@ import zlib
 from pathlib import Path
 
 APP_NAME = "API 中转站测活工具"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) api-probe/1.0"
 DEFAULT_TIMEOUT = 20.0
 CONFIG_PATH = Path.home() / ".api_probe.json"
@@ -1227,7 +1243,429 @@ def export_json(payload, path: str) -> None:
 
 
 # =====================================================================
-# 七、图形界面
+# 七、Claude Code CLI 接入
+# =====================================================================
+# Claude Code CLI（2.x）可以直接接第三方网关，但有两条硬性前提：
+#   1. 网关必须实现 Anthropic Messages 协议：POST <BASE>/v1/messages
+#      只提供 OpenAI 协议（/v1/chat/completions）的站无法直连，需要协议转换层
+#   2. 模型名必须按别名映射：CLI 内部用 sonnet/opus/haiku/fable 别名，不映射就会拿官方 id
+#      去打你的网关，报 404 model_not_found（认证其实是通的）
+# 本节负责：通道检测 → 生成配置 → 合并写入（带备份）/ 生成启动脚本 / 生成隔离配置目录 → 端到端验证
+
+CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
+CLAUDE_CLI_CANDIDATES = (
+    Path.home() / ".local" / "bin" / "claude.exe",
+    Path.home() / ".local" / "bin" / "claude",
+    Path(os.environ.get("APPDATA") or "") / "npm" / "claude.cmd",
+    Path(os.environ.get("APPDATA") or "") / "npm" / "claude",
+)
+# 由本工具管理的键：写入前先清掉这几个，避免 ANTHROPIC_AUTH_TOKEN 与 ANTHROPIC_API_KEY 同时存在
+CLAUDE_MANAGED_ENV_KEYS = (
+    "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY",
+    "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL",
+)
+CLAUDE_ALIASES = ("sonnet", "opus", "haiku", "fable")
+CLAUDE_MSG_PATH = "/v1/messages"
+CLAUDE_PING_PROMPT = "Reply with exactly: PONG"
+# 本工具生成的启动脚本 / 隔离配置目录都放这里，便于查找
+CLAUDE_OUTPUT_DIR = Path.home() / ".api_probe"
+
+
+def claude_auth_headers(auth_style: str, key: str) -> dict:
+    """bearer → Authorization: Bearer xxx；x-api-key → x-api-key: xxx"""
+    h = {"anthropic-version": "2023-06-01", "Content-Type": "application/json"}
+    if key:
+        if auth_style == "x-api-key":
+            h["x-api-key"] = key
+        else:
+            h["Authorization"] = f"Bearer {key}"
+    return h
+
+
+def claude_base_for_gateway(base: str) -> str:
+    """ANTHROPIC_BASE_URL 只写到前缀，CLI 自己会拼 /v1/messages。
+
+    这里直接复用 normalize_base：它会剥掉 /v1、/v1beta、/v1/messages 等后缀，
+    也会给没写协议的地址补上 https://。所以用户把完整端点粘进来也不会拼成 /v1/v1/messages。
+    """
+    return normalize_base(base)
+
+
+def claude_ping_payload(model: str, stream: bool = False) -> dict:
+    return {"model": model, "max_tokens": 16,
+            "messages": [{"role": "user", "content": CLAUDE_PING_PROMPT}],
+            "stream": bool(stream)}
+
+
+def anthropic_reply_text(obj) -> str:
+    """从 Anthropic Messages 响应里取纯文本。"""
+    if not isinstance(obj, dict):
+        return ""
+    out = []
+    for blk in obj.get("content") or []:
+        if isinstance(blk, dict) and blk.get("type") == "text":
+            out.append(str(blk.get("text") or ""))
+        elif isinstance(blk, str):
+            out.append(blk)
+    return "".join(out).strip()
+
+
+def check_anthropic_channel(base: str, key: str, model: str = "",
+                            timeout: float = DEFAULT_TIMEOUT, verify: bool = True,
+                            log=None, stop_event: threading.Event | None = None) -> dict:
+    """检测网关是否实现 Anthropic Messages 协议（Claude Code 直连的前提）。
+
+    会依次尝试两种鉴权头：先 Authorization: Bearer，失败再 x-api-key；
+    成功后补一次流式测试（CLI 全程走流式，只测非流式不够）。
+    """
+    def L(msg):
+        if log:
+            log(msg)
+
+    res = {"ok": False, "auth_style": "", "status": 0, "error": "", "model_used": model or "",
+           "latency_ms": None, "stream_ok": False, "first_ms": None, "reply": "",
+           "model_not_found": False, "path_issue": False, "tried": [],
+           "url": "", "verdict": "", "verdict_level": "error"}
+    base = claude_base_for_gateway(base)
+    if not base:
+        res["verdict"] = "地址为空"
+        return res
+    url = base + CLAUDE_MSG_PATH
+    res["url"] = url
+    payload = claude_ping_payload(res["model_used"])
+    # 探测阶段给每次尝试设上限：慢站/挂死的站不至于把整个检测拖成几分钟
+    # （流式测试仍用完整 timeout）
+    probe_timeout = max(5.0, min(timeout, 20.0))
+
+    for style in ("bearer", "x-api-key"):
+        if stop_event is not None and stop_event.is_set():
+            res["verdict"] = "已手动停止"
+            return res
+        r = http_request("POST", url, headers=claude_auth_headers(style, key), payload=payload,
+                         timeout=probe_timeout, verify=verify)
+        # 网络层错误（超时/连不上）比空响应体更有信息量，优先用它
+        msg = "" if r.ok else (r.error or extract_error_message(r.text, r.status))
+        info = {"auth_style": style, "status": r.status, "ms": r.latency_ms, "error": msg}
+        L(f"  [Anthropic] POST {url}（{style}）→ {r.status or r.error} {r.latency_ms}ms")
+        res["tried"].append(info)
+        if r.ok:
+            res.update(ok=True, auth_style=style, status=r.status, latency_ms=r.latency_ms,
+                       reply=anthropic_reply_text(r.json)[:240], error="")
+            info["ok"] = True
+            break
+        low = ((msg or "") + " " + (r.text or "")[:600]).lower()
+        if r.status == 404 and ("model" in low or "not supported" in low):
+            # 404 且提到模型 → 认证已通过，只是模型 id 不在该 key 的可用集合里
+            res.update(model_not_found=True, auth_style=style, status=404, error=msg,
+                       latency_ms=r.latency_ms)
+            break
+        if r.status == 404:
+            res.update(path_issue=True, status=404, error=msg, latency_ms=r.latency_ms)
+            break
+        if r.status in (401, 403):
+            res.update(status=r.status, error=msg)
+            continue          # 换个头再试
+        res.update(status=r.status, error=msg, latency_ms=r.latency_ms)
+        break
+
+    # 流式测试（需要已知可用模型）
+    if res["ok"] and res["model_used"] and not (stop_event is not None and stop_event.is_set()):
+        L(f"  流式测试 POST {url}（stream=true）")
+        col = stream_generate(url, claude_auth_headers(res["auth_style"], key),
+                              claude_ping_payload(res["model_used"], stream=True),
+                              feed_anthropic, timeout=timeout, verify=verify,
+                              stop_event=stop_event)
+        res["stream_ok"] = col.first_ms is not None
+        res["first_ms"] = col.first_ms
+        if col.error:
+            res["stream_error"] = col.error
+        if col.text:
+            res["reply"] = res["reply"] or col.text[:240]
+        L(f"  流式结果：{'首字 %.0fms' % col.first_ms if col.first_ms else '失败'}"
+          + (f"（{col.error}）" if col.error else ""))
+
+    # 结论
+    if res["ok"]:
+        if res["stream_ok"]:
+            res["verdict"] = (f"通道可用：认证方式 {res['auth_style']}，"
+                              f"非流式 {res['latency_ms']:.0f}ms / 首字 {res['first_ms']:.0f}ms")
+            res["verdict_level"] = "ok"
+        else:
+            res["verdict"] = f"非流式可用（认证 {res['auth_style']}），但流式未通过 —— CLI 会走流式，建议换渠道"
+            res["verdict_level"] = "warn"
+    elif res["model_not_found"]:
+        res["verdict"] = (f"认证通过，但模型「{res['model_used']}」在该网关不可用"
+                          " → 需要做模型映射（这一步是 90% 失败的原因）")
+        res["verdict_level"] = "warn"
+    elif res["path_issue"]:
+        res["verdict"] = ("该地址没有 /v1/messages：要么 ANTHROPIC_BASE_URL 写法不对，"
+                          "要么这个站只提供 OpenAI 协议，Claude Code 无法直连")
+        res["verdict_level"] = "error"
+    else:
+        statuses = [t.get("status") for t in res.get("tried", [])]
+        if statuses and all(s in (401, 403) for s in statuses):
+            # 返回 401/403 而不是 404 → 路由是存在的，协议多半支持，问题在 Key
+            res["verdict"] = (f"端点存在（返回 {statuses[0]} 而非 404，说明 /v1/messages 是实现了的），"
+                              f"但鉴权失败：{res['error']} —— 换一个有效的 Key 再测")
+            res["verdict_level"] = "warn"
+        else:
+            res["verdict"] = f"通道不可用：{res['error'] or '未知错误'}"
+            res["verdict_level"] = "error"
+    return res
+
+
+def suggest_claude_model_map(models: list[dict], fallback: str = "") -> dict:
+    """从站点模型列表猜 sonnet/opus/haiku/fable 该映射到哪个真实 id。"""
+    ids = [str(m.get("id") or "") for m in (models or []) if m.get("id")]
+    out: dict = {}
+    for alias in CLAUDE_ALIASES:
+        cands = [i for i in ids if alias in i.lower()]
+        if cands:
+            cands.sort(key=lambda s: (len(s), s))     # 同族优先取最短（通常是没有日期后缀的主名）
+            out[alias] = cands[0]
+    default = out.get("sonnet") or fallback or (choose_default_model(models) if models else "")
+    if default:
+        out["default"] = default
+    return out
+
+
+def build_claude_env(base: str, key: str, auth_style: str, model_map: dict | None = None,
+                     model_default: str = "") -> dict:
+    """生成要写进 CLI 的 ANTHROPIC_* 环境变量（key 只出其一，避免两个头打架）。"""
+    env = {"ANTHROPIC_BASE_URL": claude_base_for_gateway(base)}
+    if key:
+        if auth_style == "x-api-key":
+            env["ANTHROPIC_API_KEY"] = key
+        else:
+            env["ANTHROPIC_AUTH_TOKEN"] = key
+    mm = dict(model_map or {})
+    default = (model_default or mm.pop("default", "") or mm.get("sonnet") or "").strip()
+    if default:
+        env["ANTHROPIC_MODEL"] = default
+    for alias in CLAUDE_ALIASES:
+        v = str(mm.get(alias) or "").strip()
+        if v:
+            env[f"ANTHROPIC_DEFAULT_{alias.upper()}_MODEL"] = v
+    return env
+
+
+def merge_claude_settings(existing, env: dict) -> dict:
+    """把 env 合并进 settings.json：只替换本工具管理的键，其它内容原样保留。"""
+    out = dict(existing) if isinstance(existing, dict) else {}
+    block = dict(out.get("env") or {}) if isinstance(out.get("env"), dict) else {}
+    for k in CLAUDE_MANAGED_ENV_KEYS:
+        block.pop(k, None)                    # 先清掉旧的，保证不会 AUTH_TOKEN/API_KEY 并存
+    block.update({k: v for k, v in (env or {}).items()
+                  if k in CLAUDE_MANAGED_ENV_KEYS and v})
+    out["env"] = block
+    return out
+
+
+def read_claude_settings(path: str | Path | None = None) -> dict:
+    p = Path(path) if path else CLAUDE_SETTINGS_PATH
+    try:
+        if not p.exists():
+            return {}
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def install_claude_settings(env: dict, path: str | Path | None = None,
+                            backup: bool = True) -> dict:
+    """合并写入 settings.json。会先备份；现有文件解析不了就中止，绝不覆盖。"""
+    p = Path(path) if path else CLAUDE_SETTINGS_PATH
+    out = {"ok": False, "path": str(p), "backup": "", "error": "", "settings": {}}
+    existing: dict = {}
+    if p.exists():
+        try:
+            raw = p.read_text(encoding="utf-8")
+            data = json.loads(raw) if raw.strip() else {}
+            if not isinstance(data, dict):
+                raise ValueError("顶层不是 JSON 对象")
+            existing = data
+        except Exception as e:  # noqa: BLE001
+            out["error"] = f"现有配置无法解析（{e}），已中止以免覆盖：{p}"
+            return out
+        if backup:
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            bak = p.with_name(p.name + f".bak-apiprobe-{ts}")
+            try:
+                shutil.copy2(p, bak)
+                out["backup"] = str(bak)
+            except Exception as e:  # noqa: BLE001
+                out["error"] = f"备份失败，已中止：{e}"
+                return out
+    merged = merge_claude_settings(existing, env)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(merged, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"写入失败：{e}"
+        return out
+    out["ok"] = True
+    out["settings"] = merged
+    return out
+
+
+def slugify(name: str, maxlen: int = 24) -> str:
+    s = re.sub(r"[^A-Za-z0-9_-]+", "-", (name or "").strip()).strip("-").lower()
+    return s[:maxlen] or "site"
+
+
+def non_ascii_env_key(env: dict) -> str:
+    """返回第一个含非 ASCII 的键名（.bat 只能装 ASCII，否则 cmd 会读乱）。"""
+    for k, v in (env or {}).items():
+        if not str(v).isascii():
+            return str(k)
+    return ""
+
+
+def render_launcher_bat(env: dict, config_dir: str = "") -> str:
+    """生成启动脚本内容（CRLF + 纯 ASCII，理由见 README 的 .bat 说明）。"""
+    lines = ["@echo off",
+             "rem Claude Code launcher generated by api_probe - keep this file ASCII-only,",
+             "rem because cmd.exe parses .bat with the OEM code page."]
+    for k in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY",
+              "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+              "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+              "ANTHROPIC_DEFAULT_FABLE_MODEL"):
+        if env.get(k):
+            lines.append(f'set "{k}={env[k]}"')
+    if config_dir:
+        lines.append(f'set "CLAUDE_CONFIG_DIR={config_dir}"')
+    lines.append("claude %*")
+    return "\r\n".join(lines) + "\r\n"
+
+
+def write_claude_launcher(env: dict, path: str | Path, config_dir: str = "") -> dict:
+    out = {"ok": False, "path": str(path), "error": ""}
+    bad = non_ascii_env_key(env)
+    if bad:
+        out["error"] = (f"{bad} 的值含非 ASCII 字符，无法安全写进 .bat"
+                        "（cmd 按 OEM 码页读批处理）——请改用写入 settings.json 的方式")
+        return out
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(render_launcher_bat(env, config_dir), encoding="ascii", newline="")
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"写入失败：{e}"
+        return out
+    out["ok"] = True
+    return out
+
+
+def write_isolated_claude_config(env: dict, config_dir: str | Path) -> dict:
+    """生成一个独立配置目录（配合 CLAUDE_CONFIG_DIR 用），与正式 ~/.claude 完全隔离。"""
+    d = Path(config_dir)
+    out = {"ok": False, "dir": str(d), "path": "", "error": ""}
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / "settings.json"
+        existing = {}
+        if p.exists():
+            try:
+                existing = json.loads(p.read_text(encoding="utf-8")) or {}
+            except Exception:
+                existing = {}
+        p.write_text(json.dumps(merge_claude_settings(existing, env),
+                                ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        out.update(ok=True, path=str(p))
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"生成失败：{e}"
+    return out
+
+
+def find_claude_cli() -> str:
+    for c in CLAUDE_CLI_CANDIDATES:
+        try:
+            if c and str(c) not in ("", ".") and Path(c).exists():
+                return str(c)
+        except Exception:
+            continue
+    try:
+        return shutil.which("claude") or ""
+    except Exception:
+        return ""
+
+
+def verify_claude_cli(env: dict, cli_path: str = "", timeout: float = 240.0,
+                      log=None) -> dict:
+    """端到端验证：在一个空的隔离配置目录里跑 `claude -p PONG`，证明整条链路真的通。"""
+    def L(msg):
+        if log:
+            log(msg)
+
+    res = {"ok": False, "cli": "", "cmd": "", "result": "", "error": "", "status": "",
+           "is_error": None, "terminal_reason": "", "model_usage": {}, "config_dir": "",
+           "raw": ""}
+    cli = cli_path or find_claude_cli()
+    if cli and not Path(cli).exists():
+        try:
+            if not shutil.which(cli):
+                cli = ""
+        except Exception:
+            cli = ""
+    res["cli"] = cli
+    if not cli:
+        res["error"] = "没找到 claude 命令：先安装 @anthropic-ai/claude-code，或确认它在 PATH 里"
+        return res
+    tmp = Path(tempfile.mkdtemp(prefix="api_probe_cc_"))
+    res["config_dir"] = str(tmp)
+    run_env = dict(os.environ)
+    for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+              "ANTHROPIC_MODEL"):
+        run_env.pop(k, None)
+    run_env.update({k: str(v) for k, v in (env or {}).items() if v})
+    run_env["CLAUDE_CONFIG_DIR"] = str(tmp)      # 隔离：不读也不写你正式的 ~/.claude
+    args = [cli, "-p", CLAUDE_PING_PROMPT, "--max-turns", "1", "--output-format", "json"]
+    if cli.lower().endswith((".cmd", ".bat")):
+        args = ["cmd", "/c"] + args
+    res["cmd"] = " ".join(args)
+    L(f"  执行：{res['cmd']}（CLAUDE_CONFIG_DIR={tmp}）")
+    try:
+        cp = subprocess.run(args, env=run_env, capture_output=True, text=True,
+                            encoding="utf-8", errors="replace", timeout=timeout,
+                            cwd=str(tmp))
+    except subprocess.TimeoutExpired:
+        res["error"] = f"执行超时（>{timeout:.0f}s）"
+    except Exception as e:  # noqa: BLE001
+        res["error"] = f"执行失败：{type(e).__name__}: {e}"
+    else:
+        raw = (cp.stdout or "").strip()
+        res["raw"] = raw[-2000:]
+        obj = safe_json(raw)
+        if isinstance(obj, dict):
+            res["result"] = str(obj.get("result") or "")
+            res["is_error"] = obj.get("is_error")
+            res["terminal_reason"] = str(obj.get("terminal_reason") or "")
+            res["status"] = str(obj.get("api_error_status") or "")
+            if isinstance(obj.get("modelUsage"), dict):
+                res["model_usage"] = obj["modelUsage"]
+            res["ok"] = (not obj.get("is_error")) and "PONG" in res["result"]
+        if not res["ok"] and not res["error"]:
+            res["error"] = (res["result"] or (cp.stderr or "").strip()[:400]
+                            or "输出无法解析为 JSON")
+    shutil.rmtree(tmp, ignore_errors=True)
+    return res
+
+
+def find_claude_backups(path: str | Path | None = None) -> list[Path]:
+    """列出 settings.json 旁边的备份（本工具的 .bak-apiprobe-* 与其它 .bak-* 都算）。"""
+    p = Path(path) if path else CLAUDE_SETTINGS_PATH
+    try:
+        items = [q for q in p.parent.glob(p.name + ".bak*") if q.is_file()]
+    except Exception:
+        return []
+    return sorted(items, key=lambda q: q.stat().st_mtime, reverse=True)
+
+
+# =====================================================================
+# 八、图形界面
 # =====================================================================
 
 # 「站点」下拉里那个不落盘的临时项
@@ -1285,6 +1723,10 @@ class ProbeApp:
         self.sites: list[dict] = []
         self.adhoc: dict = {"name": ADHOC_SITE, "url": "", "key": "", "model": ""}
         self._active_site = ADHOC_SITE            # 当前已装载进输入框的那一格
+        # Claude Code 接入
+        self.cc_state: dict = {}                  # 最近一次通道检测结果
+        self.cc_model_vars: dict = {}             # 别名 -> (StringVar, Combobox)
+        self.tab_claude = None
 
         root.title(f"{APP_NAME} v{APP_VERSION}")
         root.geometry("1180x760")
@@ -1394,6 +1836,8 @@ class ProbeApp:
         self.btn_gen.pack(side="left", padx=6)
         self.btn_stop = ttk.Button(btns, text="■  停止", command=self.stop, state="disabled")
         self.btn_stop.pack(side="left", padx=6)
+        ttk.Button(btns, text="⇢ 接入 Claude Code",
+                   command=self.goto_claude_tab).pack(side="left", padx=(14, 4))
         ttk.Button(btns, text="复制结论", command=self.copy_verdict).pack(side="left", padx=(18, 4))
         ttk.Button(btns, text="导出 JSON", command=lambda: self.export_last("json")).pack(side="left", padx=4)
         ttk.Button(btns, text="导出 CSV", command=lambda: self.export_last("csv")).pack(side="left", padx=4)
@@ -1407,6 +1851,7 @@ class ProbeApp:
         self._build_tab_overview()
         self._build_tab_models()
         self._build_tab_batch()
+        self._build_tab_claude()
         self._build_tab_log()
 
         # 底部状态
@@ -1527,6 +1972,103 @@ class ProbeApp:
             self.tv_batch.tag_configure(lvl, foreground=color)
         self.tv_batch.bind("<Double-1>", self._on_batch_dclick)
 
+    def _build_tab_claude(self):
+        tk, ttk = self.tk, self.ttk
+        frame = ttk.Frame(self.nb)
+        self.nb.add(frame, text="  Claude Code  ")
+        self.tab_claude = frame
+
+        # ---- 通道检测 ----
+        head = ttk.LabelFrame(
+            frame, text=" 前提：网关要实现 Anthropic Messages 协议（POST <BASE>/v1/messages）；CLI 需 2.x ")
+        head.pack(fill="x", padx=6, pady=(6, 4))
+        r1 = ttk.Frame(head)
+        r1.pack(fill="x", padx=8, pady=(6, 2))
+        self.btn_cc_check = ttk.Button(r1, text="①  检测通道 /v1/messages", command=self.cc_check)
+        self.btn_cc_check.pack(side="left")
+        ttk.Label(r1, text="（用当前选中站点的地址与 Key；先过这一步再写配置）",
+                  style="Hint.TLabel").pack(side="left", padx=6)
+        self.lbl_cc_cli = ttk.Label(r1, text="", style="Hint.TLabel")
+        self.lbl_cc_cli.pack(side="right")
+
+        self.tv_cc = ttk.Treeview(head, columns=("k", "v"), show="headings", height=6)
+        self.tv_cc.heading("k", text="项目")
+        self.tv_cc.heading("v", text="结果")
+        self.tv_cc.column("k", width=110, anchor="w", stretch=False)
+        self.tv_cc.column("v", width=880, anchor="w")
+        self.tv_cc.pack(fill="x", padx=8, pady=(2, 8))
+        for lvl, color in COLORS.items():
+            self.tv_cc.tag_configure(lvl, foreground=color)
+
+        # ---- 模型映射 ----
+        mapf = ttk.LabelFrame(
+            frame, text=" 模型映射：CLI 别名 → 网关真实模型 id（不做映射 = 拿官方 id 去打你的网关 = 404 model_not_found） ")
+        mapf.pack(fill="x", padx=6, pady=4)
+        grid = ttk.Frame(mapf)
+        grid.pack(fill="x", padx=8, pady=(6, 2))
+        pairs = [("默认模型", "default"), ("sonnet", "sonnet"), ("opus", "opus"),
+                 ("haiku", "haiku"), ("fable", "fable")]
+        for i, (label, key) in enumerate(pairs):
+            row, col = divmod(i, 2)
+            ttk.Label(grid, text=label).grid(row=row, column=col * 3, sticky="w",
+                                             padx=(0, 4), pady=3)
+            var = tk.StringVar()
+            cmb = ttk.Combobox(grid, textvariable=var, width=32, font=self.mono_font)
+            cmb.grid(row=row, column=col * 3 + 1, sticky="we", padx=(0, 16), pady=3)
+            self.cc_model_vars[key] = (var, cmb)
+        grid.columnconfigure(1, weight=1)
+        grid.columnconfigure(4, weight=1)
+        r2 = ttk.Frame(mapf)
+        r2.pack(fill="x", padx=8, pady=(0, 6))
+        ttk.Button(r2, text="从当前站点模型列表自动匹配",
+                   command=self.cc_autofill).pack(side="left")
+        ttk.Label(r2, text="（也可直接手打 id；列表为空就先做上面的第 ① 步）",
+                  style="Hint.TLabel").pack(side="left", padx=6)
+
+        # ---- 接入方式 ----
+        act = ttk.LabelFrame(frame, text=" 接入方式（可多选） ")
+        act.pack(fill="x", padx=6, pady=4)
+        self.cc_write_settings = tk.BooleanVar(value=True)
+        self.cc_write_launcher = tk.BooleanVar(value=False)
+        self.cc_write_isolated = tk.BooleanVar(value=False)
+        self.cc_run_verify = tk.BooleanVar(value=True)
+        ttk.Checkbutton(act, text="写入用户配置 ~/.claude/settings.json（合并 + 自动备份）",
+                        variable=self.cc_write_settings).pack(anchor="w", padx=8, pady=(6, 2))
+        r3 = ttk.Frame(act)
+        r3.pack(fill="x", padx=8, pady=2)
+        ttk.Checkbutton(r3, text="生成启动脚本（设环境变量，不落盘 Key）",
+                        variable=self.cc_write_launcher).pack(side="left")
+        ttk.Checkbutton(r3, text="生成隔离配置目录（CLAUDE_CONFIG_DIR，与正式配置互不干扰）",
+                        variable=self.cc_write_isolated).pack(side="left", padx=(16, 0))
+        r4 = ttk.Frame(act)
+        r4.pack(fill="x", padx=8, pady=(2, 4))
+        ttk.Checkbutton(r4, text="运行端到端验证（claude -p PONG，隔离目录，不碰你的正式配置）",
+                        variable=self.cc_run_verify).pack(side="left")
+        self.lbl_cc_target = ttk.Label(r4, text=f"配置文件：{CLAUDE_SETTINGS_PATH}",
+                                       style="Hint.TLabel")
+        self.lbl_cc_target.pack(side="right")
+        r5 = ttk.Frame(act)
+        r5.pack(fill="x", padx=8, pady=(0, 8))
+        self.btn_cc_install = ttk.Button(r5, text="▶  一键接入", command=self.cc_install)
+        self.btn_cc_install.pack(side="left")
+        ttk.Button(r5, text="仅预览配置", command=self.cc_preview).pack(side="left", padx=4)
+        ttk.Button(r5, text="复制临时命令", command=self.cc_copy_oneliner).pack(side="left", padx=4)
+        ttk.Button(r5, text="恢复上次备份", command=self.cc_restore).pack(side="left", padx=(14, 4))
+        ttk.Button(r5, text="打开 ~/.claude", command=self.cc_open_dir).pack(side="left")
+        ttk.Button(r5, text="打开输出目录",
+                   command=lambda: self._open_path(CLAUDE_OUTPUT_DIR)).pack(side="left", padx=4)
+
+        # ---- 日志 ----
+        logf = ttk.LabelFrame(frame, text=" 执行日志 ")
+        logf.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.txt_cc = tk.Text(logf, font=self.mono_font, wrap="word", height=8,
+                              background="#111827", foreground="#e5e7eb",
+                              insertbackground="#e5e7eb")
+        vs = ttk.Scrollbar(logf, orient="vertical", command=self.txt_cc.yview)
+        self.txt_cc.configure(yscrollcommand=vs.set)
+        self.txt_cc.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
+        vs.pack(side="right", fill="y", pady=6, padx=(0, 6))
+
     def _build_tab_log(self):
         tk, ttk = self.tk, self.ttk
         frame = ttk.Frame(self.nb)
@@ -1540,6 +2082,275 @@ class ProbeApp:
         self.txt_log = tk.Text(frame, font=self.mono_font, wrap="word", state="disabled",
                                background="#111827", foreground="#e5e7eb", insertbackground="#e5e7eb")
         self.txt_log.pack(fill="both", expand=True, padx=6, pady=6)
+
+    # ---------------- Claude Code 接入 ----------------
+    def _open_path(self, path) -> None:
+        p = Path(path)
+        if not p.exists():
+            self._set_status(f"路径不存在：{p}")
+            return
+        try:
+            if p.is_dir():
+                os.startfile(str(p))                      # Windows
+            else:
+                subprocess.Popen(["explorer", "/select,", str(p)])
+        except Exception as e:  # noqa: BLE001
+            self._set_status(f"打开失败：{e}")
+
+    def cc_log_msg(self, msg: str) -> None:
+        self.q.put(("cc_log", msg))
+
+    def _cc_log_append(self, msg: str) -> None:
+        self.txt_cc.insert("end", f"{time.strftime('%H:%M:%S')}  {msg}\n")
+        self.txt_cc.see("end")
+
+    def _set_cc_busy(self, flag: bool) -> None:
+        state = "disabled" if flag else "normal"
+        for btn in (getattr(self, "btn_cc_check", None), getattr(self, "btn_cc_install", None)):
+            try:
+                btn.configure(state=state)
+            except Exception:
+                pass
+
+    def goto_claude_tab(self):
+        self.nb.select(self.tab_claude)
+        self.cc_refresh_context()
+        self._set_status("先点「① 检测通道 /v1/messages」，通过后再「一键接入」")
+
+    def cc_refresh_context(self):
+        """刷新 CLI 探测结果、候选模型下拉、配置路径。"""
+        models = (self.site_result or {}).get("models") or []
+        ids = [str(m.get("id") or "") for m in models if m.get("id")]
+        for key, (var, cmb) in self.cc_model_vars.items():
+            cmb.configure(values=ids)
+            if key == "default" and not var.get() and self.var_model.get().strip():
+                var.set(self.var_model.get().strip())
+        cli = find_claude_cli()
+        self.lbl_cc_cli.configure(text=("CLI：" + cli) if cli
+                                  else "没找到 claude 命令（端到端验证会跳过）")
+        self.lbl_cc_target.configure(text=f"配置文件：{CLAUDE_SETTINGS_PATH}")
+        if ids:
+            self.cc_autofill()
+
+    def cc_autofill(self):
+        models = (self.site_result or {}).get("models") or []
+        if not models:
+            self._set_status("还没有模型列表：先在主界面点「① 获取模型列表」")
+            return
+        m = suggest_claude_model_map(models, fallback=self.var_model.get().strip())
+        n = 0
+        for k, v in m.items():
+            if k in self.cc_model_vars and v:
+                self.cc_model_vars[k][0].set(v)
+                n += 1
+        self._set_status(f"已按模型名自动匹配 {n} 项，可手工改成你要的 id")
+
+    def cc_check(self):
+        if self.busy:
+            self._set_status("正在测试中，请稍候…")
+            return
+        base = self.var_url.get().strip()
+        if not base:
+            self._set_status("请先填写 API 地址")
+            return
+        key = self.var_key.get().strip()
+        model = self.cc_model_vars["default"][0].get().strip() or self.var_model.get().strip()
+        self.stop_event.clear()
+        self.busy = True
+        self._set_cc_busy(True)
+        self._set_status("正在检测 Anthropic Messages 通道…")
+        self._cc_log_append(f"=== 检测通道：{base.rstrip('/')}/v1/messages"
+                            f"（模型 {model or '未指定'}）===")
+        timeout, verify = self._timeout(), bool(self.var_verify.get())
+
+        def work():
+            try:
+                res = check_anthropic_channel(base, key, model, timeout=timeout, verify=verify,
+                                              log=self.cc_log_msg, stop_event=self.stop_event)
+                self.q.put(("cc_check_done", res))
+            except Exception as e:  # noqa: BLE001
+                self.q.put(("fatal", f"{type(e).__name__}: {e}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _render_cc_check(self, res: dict):
+        self.cc_state = res
+        tv = self.tv_cc
+        tv.delete(*tv.get_children())
+
+        def add(k, v, level="info"):
+            tv.insert("", "end", values=(k, v), tags=(level,))
+
+        add("结论", res.get("verdict", ""), res.get("verdict_level", "info"))
+        add("端点", res.get("url", ""), "muted")
+        add("认证方式", res.get("auth_style") or "-")
+        add("HTTP 状态", str(res.get("status") or "-"))
+        add("非流式耗时", f"{res['latency_ms']:.0f} ms" if res.get("latency_ms") else "-")
+        add("流式首字", f"{res['first_ms']:.0f} ms" if res.get("first_ms") else "-",
+            "ok" if res.get("stream_ok") else "warn")
+        add("返回内容", (res.get("reply") or "-").replace("\n", " ")[:180])
+        for t in res.get("tried", []):
+            add(f"尝试 {t.get('auth_style')}",
+                f"HTTP {t.get('status') or '-'}　{t.get('error') or ''}"[:220],
+                "ok" if t.get("ok") else "warn")
+        self._cc_log_append(f"检测结论：{res.get('verdict', '')}")
+        self._set_status("通道检测完成")
+        self._finish_busy()
+
+    def cc_build_env(self):
+        mm = {k: v[0].get().strip() for k, v in self.cc_model_vars.items()}
+        default = mm.pop("default", "")
+        style = (self.cc_state or {}).get("auth_style") or "bearer"
+        env = build_claude_env(self.var_url.get().strip(), self.var_key.get().strip(),
+                               style, mm, default)
+        return env, style
+
+    @staticmethod
+    def _mask_env(env: dict) -> dict:
+        return {k: (mask_key(v) if ("TOKEN" in k or "KEY" in k) else v)
+                for k, v in (env or {}).items()}
+
+    def cc_preview(self):
+        env, style = self.cc_build_env()
+        if not env.get("ANTHROPIC_BASE_URL"):
+            self._set_status("请先填写 API 地址")
+            return
+        merged = merge_claude_settings(read_claude_settings(), env)
+        self._cc_log_append("=== 预览：即将合并进 settings.json 的内容（Key 已打码）===")
+        self._cc_log_append("认证头：" + ("x-api-key" if style == "x-api-key"
+                                          else "Authorization: Bearer"))
+        preview = dict(merged)
+        if isinstance(preview.get("env"), dict):
+            preview["env"] = self._mask_env(preview["env"])
+        self._cc_log_append(json.dumps(preview, ensure_ascii=False, indent=2))
+        self._set_status("预览已打印到下方日志（Key 已打码）")
+
+    def cc_copy_oneliner(self):
+        env, _ = self.cc_build_env()
+        if not env.get("ANTHROPIC_BASE_URL") or not self.var_key.get().strip():
+            self._set_status("需要地址与 Key 才能生成临时命令")
+            return
+        payload = json.dumps({"env": env}, ensure_ascii=False, separators=(",", ":"))
+        cmd = f"claude --settings '{payload}' -p \"hi\""
+        self.root.clipboard_clear()
+        self.root.clipboard_append(cmd)
+        self._cc_log_append("已复制临时命令（含真实 Key，别外发；适用于 Git Bash / PowerShell）：")
+        self._cc_log_append(cmd)
+        self._set_status("临时命令已复制到剪贴板")
+
+    def cc_install(self):
+        from tkinter import messagebox
+        if self.busy:
+            self._set_status("正在测试中，请稍候…")
+            return
+        env, _style = self.cc_build_env()
+        if not env.get("ANTHROPIC_BASE_URL"):
+            self._set_status("请先填写 API 地址")
+            return
+        if not any(k in env for k in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")):
+            if not messagebox.askyesno("没有 Key", "当前没填 Key，写进配置后 CLI 无法认证。仍要继续？"):
+                return
+        if not (self.cc_state or {}).get("ok"):
+            if not messagebox.askyesno(
+                    "还没确认通道",
+                    "建议先点「① 检测通道 /v1/messages」，确认这个网关支持 Anthropic 协议。\n\n"
+                    "（只提供 OpenAI 协议的中转站，Claude Code 无法直连）\n\n现在直接写配置吗？"):
+                return
+        do_settings = bool(self.cc_write_settings.get())
+        do_launcher = bool(self.cc_write_launcher.get())
+        do_isolated = bool(self.cc_write_isolated.get())
+        do_verify = bool(self.cc_run_verify.get())
+        if not any((do_settings, do_launcher, do_isolated, do_verify)):
+            self._set_status("没有勾选任何接入方式")
+            return
+        site = self.var_site.get()
+        slug = slugify(site if site != ADHOC_SITE else "custom")
+        outdir = CLAUDE_OUTPUT_DIR / f"claude-code-{slug}"
+        timeout = max(60.0, self._timeout() * 6)
+        self.stop_event.clear()
+        self.busy = True
+        self._set_cc_busy(True)
+        self._set_status("正在接入 Claude Code…")
+        self._cc_log_append(f"=== 一键接入开始（站点：{site}）===")
+
+        def work():
+            summary = {"ok": True, "lines": []}
+
+            def note(msg, ok=True):
+                summary["lines"].append(msg)
+                summary["ok"] = summary["ok"] and ok
+                self.cc_log_msg(msg)
+
+            try:
+                if do_settings:
+                    r = install_claude_settings(env, CLAUDE_SETTINGS_PATH)
+                    if r["ok"]:
+                        note(f"✔ 已写入 {r['path']}"
+                             + (f"（备份：{r['backup']}）" if r["backup"] else "（原本没有文件）"))
+                    else:
+                        note(f"✘ 写配置失败：{r['error']}", ok=False)
+                if do_isolated:
+                    d = outdir / "config"
+                    r = write_isolated_claude_config(env, d)
+                    if r["ok"]:
+                        note(f"✔ 隔离配置：{r['path']}")
+                        lr = write_claude_launcher(env, d / "start-claude.bat", config_dir=str(d))
+                        note(f"✔ 启动脚本：{lr['path']}" if lr["ok"]
+                             else f"✘ 启动脚本失败：{lr['error']}", ok=lr["ok"])
+                    else:
+                        note(f"✘ 隔离配置失败：{r['error']}", ok=False)
+                if do_launcher:
+                    lp = outdir / f"start-claude-{slug}.bat"
+                    r = write_claude_launcher(env, lp)
+                    note(f"✔ 启动脚本：{r['path']}" if r["ok"]
+                         else f"✘ 启动脚本失败：{r['error']}", ok=r["ok"])
+                if do_verify:
+                    note("… 正在跑端到端验证（claude -p PONG），首次可能要十几秒")
+                    vr = verify_claude_cli(env, timeout=timeout, log=self.cc_log_msg)
+                    if vr["ok"]:
+                        note(f"✔ 端到端验证通过：result={vr['result']!r} "
+                             f"terminal_reason={vr['terminal_reason'] or '-'} "
+                             f"模型={list(vr['model_usage'].keys()) or '-'}")
+                    else:
+                        note(f"✘ 端到端验证未通过：{vr['error']}"
+                             + (f"（api_error_status={vr['status']}）" if vr["status"] else ""),
+                             ok=False)
+                self.q.put(("cc_install_done", summary))
+            except Exception as e:  # noqa: BLE001
+                self.q.put(("fatal", f"{type(e).__name__}: {e}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finish_cc_install(self, summary: dict):
+        ok = bool(summary.get("ok"))
+        self._cc_log_append("=== 一键接入完成 ===" if ok else "=== 一键接入完成（有失败项，见上）===")
+        self._set_status("接入完成" if ok else "接入完成，但有失败项（见日志）")
+        self._finish_busy()
+
+    def cc_restore(self):
+        from tkinter import messagebox
+        baks = find_claude_backups()
+        if not baks:
+            self._set_status("没有找到备份文件")
+            return
+        newest = baks[0]
+        if not messagebox.askyesno(
+                "恢复备份",
+                f"用这个备份覆盖当前配置？\n\n{newest}\n\n（当前文件会先另存一份再覆盖）"):
+            return
+        try:
+            cur = CLAUDE_SETTINGS_PATH
+            if cur.exists():
+                ts = time.strftime("%Y%m%d-%H%M%S")
+                shutil.copy2(cur, cur.with_name(cur.name + f".bak-apiprobe-{ts}"))
+            shutil.copy2(newest, cur)
+            self._cc_log_append(f"✔ 已从备份恢复：{newest}")
+            self._set_status("已恢复备份")
+        except Exception as e:  # noqa: BLE001
+            self._set_status(f"恢复失败：{e}")
+
+    def cc_open_dir(self):
+        self._open_path(CLAUDE_SETTINGS_PATH.parent)
 
     # ---------------- 小工具 ----------------
     def _toggle_key(self):
@@ -2176,6 +2987,12 @@ class ProbeApp:
                     self._render_site(data)
                 elif kind == "gen_done":
                     self._render_generation(data)
+                elif kind == "cc_log":
+                    self._cc_log_append(str(data))
+                elif kind == "cc_check_done":
+                    self._render_cc_check(data)
+                elif kind == "cc_install_done":
+                    self._finish_cc_install(data)
                 elif kind == "batch_row":
                     res, done, total = data
                     self._append_batch_row(res, done, total)
@@ -2195,6 +3012,7 @@ class ProbeApp:
         self.btn_batch.configure(state="normal")
         self.btn_gen.configure(state="normal" if self.site_result else "disabled")
         self.btn_stop.configure(state="disabled")
+        self._set_cc_busy(False)
 
     # ---------------- 渲染 ----------------
     def _render_site(self, res: dict):
@@ -2222,6 +3040,10 @@ class ProbeApp:
                 text=f"{res.get('verdict', '')}（可手工在上方「指定模型」填模型名后做第 2 步）")
         self._log_append(f"=== 第 1 步完成：{res.get('verdict', '')} ===")
         self._finish_busy()
+        try:
+            self.cc_refresh_context()          # 顺手把候选模型喂给 Claude Code 页
+        except Exception:
+            pass
 
     def _render_generation(self, res: dict):
         """第 2 步完成：刷新概览并切回概览页看结论。"""
@@ -2470,7 +3292,7 @@ def run_gui() -> int:
 
 
 # =====================================================================
-# 八、自检（本地 mock 服务器，不访问外网）
+# 九、自检（本地 mock 服务器，不访问外网）
 # =====================================================================
 
 def _mock_server(mode: str):
@@ -2518,6 +3340,13 @@ def _mock_server(mode: str):
                     return self._send(404, {"error": {"message": "not found"}})
                 if not auth.startswith("Bearer "):
                     return self._send(401, {"error": {"message": "未提供令牌", "type": "one_api_error"}})
+                if mode_ == "anthropic":
+                    # 模拟一个「同时支持 OpenAI 协议与 Anthropic Messages 协议」的中转站
+                    return self._send(200, {"object": "list", "data": [
+                        {"id": "claude-fable-5-1", "object": "model", "owned_by": "anthropic"},
+                        {"id": "claude-haiku-4-5-20251001", "object": "model", "owned_by": "anthropic"},
+                        {"id": "claude-opus-5-5", "object": "model", "owned_by": "anthropic"},
+                        {"id": "claude-sonnet-5-5", "object": "model", "owned_by": "anthropic"}]})
                 return self._send(200, {"object": "list", "data": [
                     {"id": "gpt-4o", "object": "model", "owned_by": "openai"},
                     {"id": "gpt-4o-mini-2024-07-18", "object": "model", "owned_by": "openai"},
@@ -2567,9 +3396,27 @@ def _mock_server(mode: str):
                                         "usage": {"prompt_tokens": 9, "completion_tokens": 1,
                                                   "total_tokens": 10}})
             if path == "/v1/messages":
-                if not self.headers.get("x-api-key"):
+                mode_ = self.server.mode  # type: ignore[attr-defined]
+                if mode_ == "openaionly":
+                    # 只提供 OpenAI 协议的中转站：路径级 404，不带模型信息
+                    return self._send(404, {"error": {"message": "not found"}})
+                auth_hdr = self.headers.get("Authorization") or ""
+                xkey = self.headers.get("x-api-key") or ""
+                if mode_ == "xapikey":
+                    ok_auth = (xkey == "sk-mock")           # 该站只认 x-api-key
+                else:
+                    ok_auth = (xkey == "sk-mock"
+                               or auth_hdr.lower().startswith("bearer sk-mock"))
+                if not ok_auth:
                     return self._send(401, {"type": "error", "error": {
                         "type": "authentication_error", "message": "invalid x-api-key"}})
+                model = str((payload or {}).get("model") or "")
+                if model == "bad-model" or (mode_ == "modelmissing" and not model.startswith("claude-")):
+                    # 认证已通过，只是模型 id 不在该 key 的可用集合里（指南 §4 的经典 404）
+                    return self._send(404, {"type": "error", "error": {
+                        "type": "not_found_error",
+                        "message": f'Model "{model}" is not supported by any configured '
+                                   f'account in this group'}})
                 if payload.get("stream"):
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
@@ -2578,7 +3425,7 @@ def _mock_server(mode: str):
                         ("message_start", {"type": "message_start", "message": {
                             "id": "msg_mock", "model": "claude-sonnet-4-5", "usage": {"input_tokens": 8}}}),
                         ("content_block_delta", {"type": "content_block_delta",
-                                                 "delta": {"type": "text_delta", "text": "OK"}}),
+                                                 "delta": {"type": "text_delta", "text": "PONG"}}),
                         ("message_delta", {"type": "message_delta",
                                            "usage": {"output_tokens": 1}}),
                     ]
@@ -2587,7 +3434,7 @@ def _mock_server(mode: str):
                     return
                 return self._send(200, {"id": "msg_mock", "type": "message", "role": "assistant",
                                         "model": "claude-sonnet-4-5",
-                                        "content": [{"type": "text", "text": "OK"}],
+                                        "content": [{"type": "text", "text": "PONG"}],
                                         "usage": {"input_tokens": 8, "output_tokens": 1}})
             return self._send(404, {"error": {"message": "not found"}})
 
@@ -2751,6 +3598,142 @@ def selftest() -> int:
     check("向后兼容旧的明文配置",
           decode_secret("sk-plain-old", False) == "sk-plain-old")
 
+    print("\n[10] Claude Code 接入")
+    check("ANTHROPIC_BASE_URL 不带 /v1 后缀",
+          claude_base_for_gateway("https://gw.example.com/v1/") == "https://gw.example.com")
+    hb = claude_auth_headers("bearer", "sk-x")
+    hx = claude_auth_headers("x-api-key", "sk-x")
+    check("bearer 只出 Authorization",
+          hb.get("Authorization") == "Bearer sk-x" and "x-api-key" not in hb)
+    check("x-api-key 只出 x-api-key",
+          hx.get("x-api-key") == "sk-x" and "Authorization" not in hx)
+    check("两种都带 anthropic-version", hb.get("anthropic-version") == "2023-06-01")
+
+    srv, base = _mock_server("anthropic")
+    try:
+        chk = check_anthropic_channel(base, "sk-mock", "claude-sonnet-5-5", timeout=10)
+        check("支持 Anthropic 协议的站检测通过", chk["ok"] is True, f"-> {chk['verdict']}")
+        check("认证方式识别为 bearer", chk["auth_style"] == "bearer")
+        check("非流式拿到 PONG", "PONG" in chk["reply"], f"-> {chk['reply']!r}")
+        check("流式也通过", chk["stream_ok"] is True, f"-> {chk.get('stream_error')}")
+        check("端点拼的是 /v1/messages", chk["url"].endswith("/v1/messages"))
+        bad = check_anthropic_channel(base, "sk-mock", "bad-model", timeout=10)
+        check("模型不可用时判为 model_not_found", bad["model_not_found"] is True,
+              f"-> {bad['verdict']}")
+        check("模型不可用时是警告级（认证其实是通的）", bad["verdict_level"] == "warn")
+    finally:
+        srv.shutdown()
+
+    srv, base = _mock_server("xapikey")
+    try:
+        chk2 = check_anthropic_channel(base, "sk-mock", "claude-sonnet-5-5", timeout=10)
+        check("只认 x-api-key 的站会自动改用该头",
+              chk2["ok"] is True and chk2["auth_style"] == "x-api-key",
+              f"-> {chk2['auth_style']} {chk2['verdict']}")
+    finally:
+        srv.shutdown()
+
+    srv, base = _mock_server("openaionly")
+    try:
+        chk3 = check_anthropic_channel(base, "sk-mock", "gpt-4o", timeout=10)
+        check("纯 OpenAI 站被识别为无法直连",
+              chk3["ok"] is False and chk3["path_issue"] is True, f"-> {chk3['verdict']}")
+    finally:
+        srv.shutdown()
+
+    srv, base = _mock_server("badkey")
+    try:
+        chk4 = check_anthropic_channel(base, "sk-bad", "claude-sonnet-5-5", timeout=10)
+        check("Key 无效时报「鉴权失败」而不是「协议不支持」",
+              chk4["ok"] is False and chk4["verdict_level"] == "warn"
+              and "鉴权失败" in chk4["verdict"], f"-> {chk4['verdict']}")
+    finally:
+        srv.shutdown()
+
+    sample = [{"id": x} for x in ["claude-fable-5-1", "claude-haiku-4-5-20251001",
+                                  "claude-opus-5-5", "claude-sonnet-5-5", "gpt-4o"]]
+    mm = suggest_claude_model_map(sample)
+    check("sonnet 映射到 claude-sonnet-5-5", mm.get("sonnet") == "claude-sonnet-5-5", f"-> {mm}")
+    check("opus 映射到 claude-opus-5-5", mm.get("opus") == "claude-opus-5-5")
+    check("haiku 映射到 claude-haiku-4-5-20251001",
+          mm.get("haiku") == "claude-haiku-4-5-20251001")
+    check("fable 映射到 claude-fable-5-1", mm.get("fable") == "claude-fable-5-1")
+    check("默认模型回落到 sonnet", mm.get("default") == "claude-sonnet-5-5")
+
+    e1 = build_claude_env("https://gw.example.com/v1", "sk-x", "bearer", mm)
+    e2 = build_claude_env("https://gw.example.com", "sk-x", "x-api-key", mm)
+    check("bearer → 只有 AUTH_TOKEN",
+          "ANTHROPIC_AUTH_TOKEN" in e1 and "ANTHROPIC_API_KEY" not in e1)
+    check("x-api-key → 只有 API_KEY",
+          "ANTHROPIC_API_KEY" in e2 and "ANTHROPIC_AUTH_TOKEN" not in e2)
+    check("BASE_URL 已去掉 /v1", e1["ANTHROPIC_BASE_URL"] == "https://gw.example.com")
+    check("别名映射都写进去了",
+          e1.get("ANTHROPIC_DEFAULT_OPUS_MODEL") == "claude-opus-5-5"
+          and e1.get("ANTHROPIC_MODEL") == "claude-sonnet-5-5")
+
+    old_settings = {"env": {"ANTHROPIC_AUTH_TOKEN": "old-token", "FOO": "bar"},
+                    "permissions": {"allow": ["Bash"]}}
+    merged = merge_claude_settings(old_settings, dict(e2))
+    check("合并时清掉旧 AUTH_TOKEN（不会两个 key 变量并存）",
+          "ANTHROPIC_AUTH_TOKEN" not in merged["env"])
+    check("合并后写入 API_KEY", merged["env"].get("ANTHROPIC_API_KEY") == "sk-x")
+    check("保留无关的 env 键", merged["env"].get("FOO") == "bar")
+    check("保留非 env 的顶层配置", merged.get("permissions") == {"allow": ["Bash"]})
+
+    with tempfile.TemporaryDirectory() as td:
+        sp = Path(td) / "settings.json"
+        r1 = install_claude_settings(dict(e1), sp)
+        check("首次写配置成功", r1["ok"] and sp.exists(), f"-> {r1.get('error')}")
+        check("原本没有文件时不产生备份", r1["backup"] == "")
+        r2 = install_claude_settings(dict(e2), sp)
+        check("二次写入会先备份", r2["ok"] and Path(r2["backup"]).exists(), f"-> {r2['backup']}")
+        saved = json.loads(sp.read_text(encoding="utf-8"))
+        check("落盘后只有一个 key 变量",
+              ("ANTHROPIC_AUTH_TOKEN" in saved["env"]) != ("ANTHROPIC_API_KEY" in saved["env"]))
+        sp.write_text("{ 这不是 json", encoding="utf-8")
+        r3 = install_claude_settings(dict(e1), sp)
+        check("坏配置拒绝覆盖", r3["ok"] is False and "无法解析" in r3["error"], f"-> {r3['error']}")
+        check("坏配置内容原样保留", sp.read_text(encoding="utf-8") == "{ 这不是 json")
+
+        lp = Path(td) / "start-claude.bat"
+        lr = write_claude_launcher(dict(e1), lp)
+        body = lp.read_bytes() if lp.exists() else b""
+        check("启动脚本生成成功", lr["ok"] and bool(body), f"-> {lr.get('error')}")
+        check("启动脚本是纯 ASCII", all(b < 128 for b in body))
+        check("启动脚本用 CRLF", b"\r\n" in body and b"\n\n" not in body.replace(b"\r\n", b"\n"))
+        check("启动脚本含环境变量与 claude 调用",
+              b"ANTHROPIC_BASE_URL=https://gw.example.com" in body and b"claude %*" in body)
+        badlaunch = write_claude_launcher({"ANTHROPIC_MODEL": "中文模型名"},
+                                          Path(td) / "x.bat")
+        check("非 ASCII 值拒绝写 .bat",
+              badlaunch["ok"] is False and "非 ASCII" in badlaunch["error"])
+
+        iso = write_isolated_claude_config(dict(e1), Path(td) / "iso")
+        check("隔离配置目录生成成功", iso["ok"] and Path(iso["path"]).exists(),
+              f"-> {iso.get('error')}")
+        check("能找到备份文件", len(find_claude_backups(sp)) >= 1)
+
+        stub_dir = Path(td) / "stub"
+        stub_dir.mkdir()
+        stub = stub_dir / "claude.cmd"
+        stub.write_text('@echo off\r\necho {"is_error":false,"result":"PONG",'
+                        '"terminal_reason":"completed","api_error_status":null,'
+                        '"modelUsage":{"claude-sonnet-5-5":{}}}\r\n', encoding="ascii")
+        vr = verify_claude_cli(dict(e1), cli_path=str(stub), timeout=30)
+        check("能解析 CLI 的 JSON 并判定成功", vr["ok"] is True,
+              f"-> {vr.get('error')} {vr.get('raw')!r}")
+        check("拿到 result 与 terminal_reason",
+              vr["result"] == "PONG" and vr["terminal_reason"] == "completed")
+        check("验证跑在隔离配置目录里", "api_probe_cc_" in vr["config_dir"])
+        stub.write_text('@echo off\r\necho {"is_error":true,"result":"","api_error_status":404}\r\n',
+                        encoding="ascii")
+        vr2 = verify_claude_cli(dict(e1), cli_path=str(stub), timeout=30)
+        check("CLI 报错时判定为失败", vr2["ok"] is False and vr2["status"] == "404",
+              f"-> {vr2}")
+        missing = verify_claude_cli(dict(e1), cli_path=str(Path(td) / "nope.exe"), timeout=5)
+        check("找不到 CLI 时优雅失败",
+              missing["ok"] is False and "没找到" in missing["error"], f"-> {missing['error']}")
+
     print(f"\n结果：{ok_count} 通过 / {fail_count} 失败")
     return 1 if fail_count else 0
 
@@ -2763,10 +3746,16 @@ def uitest() -> int:
     """
     import tkinter as tk
     import tempfile
-    global CONFIG_PATH
+    global CONFIG_PATH, CLAUDE_SETTINGS_PATH, CLAUDE_OUTPUT_DIR
 
     real_config_path = CONFIG_PATH
     CONFIG_PATH = Path(tempfile.mkdtemp(prefix="api_probe_cfg_")) / "cfg.json"
+    # Claude Code 相关的路径同样重定向到临时目录：测试绝不碰用户真实的 ~/.claude
+    real_claude_settings = CLAUDE_SETTINGS_PATH
+    real_claude_outdir = CLAUDE_OUTPUT_DIR
+    CLAUDE_SETTINGS_PATH = (Path(tempfile.mkdtemp(prefix="api_probe_claude_"))
+                            / ".claude" / "settings.json")
+    CLAUDE_OUTPUT_DIR = Path(tempfile.mkdtemp(prefix="api_probe_ccout_"))
 
     enable_dpi_awareness()
     fails = []
@@ -2992,6 +3981,69 @@ def uitest() -> int:
               f"-> {app3.var_site.get()}")
         check("删除后只剩一个站点", len(app3.sites) == 1, f"-> {len(app3.sites)}")
         root3.destroy()
+
+        # ---- Claude Code 接入页 ----
+        check("Claude Code 标签页已创建", app.tab_claude is not None)
+        check("标签页总数为 5", len(app.nb.tabs()) == 5, f"-> {len(app.nb.tabs())}")
+        check("模型映射有五项", len(app.cc_model_vars) == 5, f"-> {list(app.cc_model_vars)}")
+
+        srv_cc, base_cc = _mock_server("anthropic")
+        try:
+            app.var_url.set(base_cc)
+            app.var_key.set("sk-mock")
+            app.fetch_models()
+            wait_until(lambda: app.site_result is not None and not app.busy, root)
+            check("Anthropic 站拿到 4 个模型", (app.site_result or {}).get("model_count") == 4,
+                  f"-> {(app.site_result or {}).get('model_count')}")
+            app.cc_refresh_context()
+            check("自动匹配到 sonnet",
+                  app.cc_model_vars["sonnet"][0].get().startswith("claude-sonnet"),
+                  f"-> {app.cc_model_vars['sonnet'][0].get()}")
+            check("候选下拉里带上了模型 id",
+                  "claude-opus-5-5" in list(app.cc_model_vars["opus"][1].cget("values")))
+
+            app.cc_check()
+            wait_until(lambda: not app.busy, root)
+            check("界面里的通道检测通过", (app.cc_state or {}).get("ok") is True,
+                  f"-> {(app.cc_state or {}).get('verdict')}")
+            check("检测结果渲染到表格", len(app.tv_cc.get_children()) >= 5,
+                  f"-> {len(app.tv_cc.get_children())}")
+            check("检测到流式可用", (app.cc_state or {}).get("stream_ok") is True)
+
+            env, _style = app.cc_build_env()
+            check("env 指向当前站点", env.get("ANTHROPIC_BASE_URL") == base_cc,
+                  f"-> {env.get('ANTHROPIC_BASE_URL')}")
+            check("env 带上了 Key", env.get("ANTHROPIC_AUTH_TOKEN") == "sk-mock")
+            check("env 里只有一个 key 变量",
+                  ("ANTHROPIC_AUTH_TOKEN" in env) != ("ANTHROPIC_API_KEY" in env))
+
+            app.cc_preview()
+            log_txt = app.txt_cc.get("1.0", "end-1c")
+            check("预览里 Key 已打码", "sk-mock" not in log_txt and "sk-***" in log_txt,
+                  f"-> {'sk-mock' in log_txt}")
+
+            app.cc_write_settings.set(True)
+            app.cc_write_launcher.set(True)
+            app.cc_write_isolated.set(True)
+            app.cc_run_verify.set(False)          # 测试里不真去调 claude CLI
+            app.cc_install()
+            wait_until(lambda: not app.busy, root, timeout=40)
+            check("一键接入写出了 settings.json", CLAUDE_SETTINGS_PATH.exists(),
+                  f"-> {CLAUDE_SETTINGS_PATH}")
+            saved_cc = json.loads(CLAUDE_SETTINGS_PATH.read_text(encoding="utf-8"))
+            check("写入的 BASE_URL 正确",
+                  saved_cc["env"]["ANTHROPIC_BASE_URL"] == base_cc,
+                  f"-> {saved_cc['env'].get('ANTHROPIC_BASE_URL')}")
+            check("写入的 sonnet 映射正确",
+                  str(saved_cc["env"].get("ANTHROPIC_DEFAULT_SONNET_MODEL", ""))
+                  .startswith("claude-sonnet"))
+            bats = list(CLAUDE_OUTPUT_DIR.rglob("*.bat"))
+            check("生成了启动脚本", len(bats) >= 2, f"-> {bats}")
+            check("启动脚本是纯 ASCII",
+                  all(all(b < 128 for b in p.read_bytes()) for p in bats))
+            check("接入日志有输出", "一键接入完成" in app.txt_cc.get("1.0", "end-1c"))
+        finally:
+            srv_cc.shutdown()
     except Exception as e:  # noqa: BLE001
         import traceback
         traceback.print_exc()
@@ -3003,6 +4055,8 @@ def uitest() -> int:
             pass
         srv.shutdown()
         CONFIG_PATH = real_config_path
+        CLAUDE_SETTINGS_PATH = real_claude_settings
+        CLAUDE_OUTPUT_DIR = real_claude_outdir
 
     if fails:
         print(f"界面流程自检失败 {len(fails)} 项：{fails}")
@@ -3012,7 +4066,7 @@ def uitest() -> int:
 
 
 # =====================================================================
-# 九、命令行
+# 十、命令行
 # =====================================================================
 
 def cli_probe(args) -> int:
@@ -3042,6 +4096,30 @@ def cli_probe(args) -> int:
                 print(f"  - {m['id']}" + (f"   [{m['owner']}]" if m.get("owner") else ""))
             print("\n下一步：挑一个模型，加 --model 再跑一次即可做生成测试。")
         return 0 if res.get("ok_site") else 2
+
+    if args.claude_check:
+        base = normalize_base(args.url)
+        chk = check_anthropic_channel(base, args.key, args.model or "", timeout=args.timeout,
+                                      verify=not args.no_verify, log=log)
+        if args.json:
+            print(json.dumps(chk, ensure_ascii=False, indent=2))
+            return 0 if chk["ok"] else 2
+        print()
+        print(f"结论        : {chk['verdict']}")
+        print(f"端点        : {chk['url']}")
+        print(f"认证方式    : {chk['auth_style'] or '-'}")
+        print(f"HTTP 状态   : {chk['status']}")
+        print(f"非流式耗时  : {chk['latency_ms'] or '-'} ms")
+        print(f"流式首字    : {chk['first_ms'] or '-'} ms")
+        print(f"返回内容    : {chk['reply'] or '-'}")
+        for t in chk.get("tried", []):
+            print(f"  尝试 {t.get('auth_style'):9} HTTP {t.get('status') or '-'}　{t.get('error') or ''}")
+        env = build_claude_env(base, args.key or "sk-xxx", chk["auth_style"] or "bearer",
+                               {}, args.model or "")
+        print("\n可写入 ~/.claude/settings.json 的 env（示意，Key 已替换）：")
+        print(json.dumps({"env": {k: (mask_key(v) if "KEY" in k or "TOKEN" in k else v)
+                                  for k, v in env.items()}}, ensure_ascii=False, indent=2))
+        return 0 if chk["ok"] else 2
 
     res = probe(args.url, args.key, model=args.model or "", timeout=args.timeout,
                 verify=not args.no_verify, deep=not args.no_deep, log=log)
@@ -3093,6 +4171,8 @@ def main(argv=None) -> int:
     ap.add_argument("--show-models", action="store_true", help="打印完整模型列表")
     ap.add_argument("--list-only", action="store_true",
                     help="只做第 1 步：拉取模型列表后退出（不做生成测试）")
+    ap.add_argument("--claude-check", action="store_true",
+                    help="检测网关是否实现 Anthropic Messages 协议（Claude Code 直连的前提）")
     ap.add_argument("--selftest", action="store_true", help="运行内置自检")
     ap.add_argument("--uitest", action="store_true", help="运行图形界面构建自检")
     args = ap.parse_args(argv)

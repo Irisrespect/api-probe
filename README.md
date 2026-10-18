@@ -1,4 +1,4 @@
-# API 中转站测活工具（api-probe） v1.3.0
+# API 中转站测活工具（api-probe） v1.4.0
 
 单文件 Windows 桌面小工具：**先管好你的一堆中转站**，选中某个站点拉回模型列表，再由你**手工挑一个模型**发测试，
 判断这个中转站 / API 端点是否真的能用，并把「协议族、首字延迟、疑似掺水」等信息摊开给你看。
@@ -19,7 +19,8 @@
 | 6 | 批量巡检 | 一次跑一堆站点，并发可调，导出 CSV/JSON 做横向对比 |
 | 7 | 持久化与安全 | 站点信息明文存、Key 用 Windows DPAPI 按用户加密，可一键清除 |
 | 8 | 命令行/自动化 | `--list-only` / `--model` / `--json`，退出码 0/2 可接 CI 或计划任务 |
-| 9 | 自检 | 本地 mock 服务器，核心 52 项 + 界面流程 65 项断言，不碰你的真实配置 |
+| 9 | 自检 | 本地 mock 服务器，核心 97 项 + 界面流程 84 项断言，不碰你的真实配置与 `~/.claude` |
+| 10 | **Claude Code 一键接入** | 检测 /v1/messages 通道 → 映射模型别名 → 写 settings.json / 生成启动脚本 → 端到端跑通 `claude -p PONG` |
 
 ---
 
@@ -65,7 +66,7 @@ API Key  [ sk-••••••••••••                              
 | 方式 | 操作 |
 | --- | --- |
 | 图形界面 | 双击 **`启动.bat`**（或用 `python api_probe.py`） |
-| 自检 | 双击 **`自检.bat`**（本地 mock 服务器，52 项断言，不访问外网） |
+| 自检 | 双击 **`自检.bat`**（本地 mock 服务器，97 项断言，不访问外网） |
 | 打包 exe | 双击 **`打包exe.bat`** → 产物在 `dist\ApiProbe.exe` |
 | 命令行 | `python api_probe.py --url https://xxx.com/v1 --key sk-xxx --list-only` |
 
@@ -149,6 +150,11 @@ API Key  [ sk-••••••••••••                              
 ### 原始日志页
 每个 HTTP 请求的地址、状态码、耗时，失败时含响应片段。排查「为什么不通」先看这里。
 
+### Claude Code 页
+第 6 节的主题：检测 `/v1/messages` 通道 → 映射模型别名 → 写配置 / 生成启动脚本 / 隔离目录 →
+跑一次 `claude -p PONG` 端到端验证。顶部按钮栏的「⇢ 接入 Claude Code」会直接跳到这里，
+并自动带上当前站点的候选模型。
+
 ---
 
 ## 5. 它到底测了什么
@@ -203,7 +209,92 @@ API Key  [ sk-••••••••••••                              
 
 ---
 
-## 6. 命令行用法
+## 6. Claude Code 一键接入
+
+Claude Code CLI 2.x 支持直连第三方网关，但有两个坑：**网关必须实现 Anthropic Messages 协议**、
+**模型名必须做映射**。这一页把「检测 → 配置 → 验证」串成一步。
+
+### 前提
+
+| 条件 | 说明 |
+| --- | --- |
+| CLI 版本 2.x | 本机实测 `@anthropic-ai/claude-code` 2.1.302 |
+| 网关实现 `POST <BASE>/v1/messages` | 只提供 OpenAI 协议（`/v1/chat/completions`）的站**无法直连**，需要协议转换层 |
+
+### ① 检测通道 /v1/messages
+
+用当前站点的地址与 Key 发一次最小请求（`Reply with exactly: PONG`），依次尝试两种鉴权头：
+
+- `Authorization: Bearer <key>` —— 绝大多数中转站，对应 `ANTHROPIC_AUTH_TOKEN`
+- `x-api-key: <key>` —— 官方 Anthropic 与部分网关，对应 `ANTHROPIC_API_KEY`
+
+之后补一次**流式**测试：CLI 全程走流式，只测非流式不够。判读：
+
+| 现象 | 含义 |
+| --- | --- |
+| 200 且有内容 | 通道 OK，可以直接接入 |
+| 401 / 403 | 端点存在但鉴权失败：Key 错/过期，或该 Key 没有这个分组的权限 |
+| **404 + 提到模型** | **认证已通过**，只是模型 id 不在你账号的可用集合里 → 去做模型映射 |
+| 404（路径级，不提模型） | 该地址没有 `/v1/messages`：要么 BASE 写法不对，要么这站只有 OpenAI 协议，无法直连 |
+
+> 每次尝试限时 20 秒（流式测试用你设的超时），避免碰到挂死的站把检测拖成几分钟。
+
+### ② 模型映射
+
+CLI 内部用 `sonnet` / `opus` / `haiku` / `fable` 别名。不映射，它就拿着**官方模型名**去打你的网关，
+报 `404 model_not_found` —— **90% 的失败都在这里**。点「从当前站点模型列表自动匹配」会按名字自动挑：
+
+```
+claude-sonnet-5-5         → sonnet（同时作为默认 ANTHROPIC_MODEL）
+claude-opus-5-5           → opus
+claude-haiku-4-5-20251001 → haiku
+claude-fable-5-1          → fable
+```
+
+匹配结果可以直接改，也可以手打列表里没有的 id。
+
+### ③ 一键接入（可多选）
+
+| 方式 | 做什么 | 适合 |
+| --- | --- | --- |
+| 写入 `~/.claude/settings.json` | **合并**写入 `env` 块（只替换本工具管理的 `ANTHROPIC_*` 键），写入前自动备份 | 个人机长期使用 |
+| 生成启动脚本 | 生成 `start-claude-<站点>.bat`：先设环境变量再调 `claude`，**Key 不落盘** | 不想把 Key 写进配置文件 |
+| 生成隔离配置目录 | 生成 `~/.api_probe/claude-code-<站点>/config/`，配合 `CLAUDE_CONFIG_DIR` 使用 | 多个网关来回切、与正式配置彻底隔离 |
+| 运行端到端验证 | 在**空的隔离配置目录**里跑 `claude -p "Reply with exactly: PONG" --max-turns 1 --output-format json` | 确认真通了，而不是"看起来配好了" |
+
+### 安全设计
+
+- **合并而非覆盖**：只动 `env` 里的 8 个 `ANTHROPIC_*` 键，你的 `permissions`、MCP 设置、
+  其它环境变量一律保留；`settings.local.json` 完全不碰
+- **先备份后写入**：备份为 `settings.json.bak-apiprobe-<时间戳>`，页面上有「恢复上次备份」按钮
+- **坏配置不覆盖**：现有 `settings.json` 解析不了就中止并报错，绝不写入
+- **Key 只出一种**：写入前会清掉旧的 `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY`，
+  保证两者不同时存在（同时存在时行为不确定，是最隐蔽的排查噩梦）
+- **验证不污染正式配置**：端到端验证使用临时 `CLAUDE_CONFIG_DIR` + 临时工作目录
+- **日志里 Key 打码**：预览配置时只显示成 `sk-abc***`
+
+### 命令行
+
+```bash
+python api_probe.py --url https://your-gateway.com --key sk-xxx --claude-check
+```
+
+打印通道检测结论、两次尝试的状态码，以及建议写入的 `env`（Key 已打码）；退出码 `0` = 通道可用。
+
+### 排错速查
+
+| 症状 | 原因 | 处置 |
+| --- | --- | --- |
+| `404 model_not_found` / `not supported by any configured account` | 模型 id 不在该 Key 的可用集合里 | 做模型映射；模型清单来自 `/v1/models` |
+| `401 authentication_error` | Key 错/过期，或网关只认另一种头 | 看检测结果里的「认证方式」，它会告诉你哪种头可用 |
+| 404 且不提模型 | `ANTHROPIC_BASE_URL` 带了 `/v1`，或该站没有此协议 | 只写网关根地址（本工具会自动剥掉 `/v1`） |
+| 回复空 / 流式中断 | 网关未完整实现流式或 reasoning/usage 字段 | 检测结果里的「流式首字」会暴露；换渠道 |
+| 报的上下文窗口、成本"很离谱" | 第三方不实现官方 usage / prompt cache，CLI 本地按官方定价估算 | 属预期行为，计费以网关后台为准 |
+| `claude: command not found` | PATH 未刷新 | 重开终端；`where claude` 复核 |
+
+---
+
+## 7. 命令行用法
 
 ```bash
 # 只做第 ① 步：列出模型，挑好了再单独测
@@ -216,17 +307,18 @@ python api_probe.py --url https://api.deepseek.com --key sk-xxx --model deepseek
 python api_probe.py --url https://xxx.com/v1 --key sk-xxx --json > out.json
 
 python api_probe.py --list-only --json          # 第 ① 步的机器可读输出
+python api_probe.py --url ... --claude-check    # 检测这个网关能不能接 Claude Code CLI
 python api_probe.py --url ... --no-verify       # 跳过 TLS 证书校验（自签证书站点）
 python api_probe.py --url ... --no-deep         # 关闭深度检测，少发一次请求
-python api_probe.py --selftest                  # 核心逻辑自检（52 项）
-python api_probe.py --uitest                    # 界面 + 站点管理 + 两段式流程自检
+python api_probe.py --selftest                  # 核心逻辑自检（97 项）
+python api_probe.py --uitest                    # 界面 + 站点管理 + 两段式 + 接入页自检
 ```
 
 退出码：`0` 成功 / `2` 失败（可直接用于脚本巡检、CI 里做连通性卡点）。
 
 ---
 
-## 7. 配置持久化（存了什么、存在哪、怎么加密）
+## 8. 配置持久化（存了什么、存在哪、怎么加密）
 
 配置文件固定为 **`~/.api_probe.json`**（Windows 上是 `C:\Users\<你>\.api_probe.json`），界面右上角也会显示实际路径。
 
@@ -252,7 +344,7 @@ python api_probe.py --uitest                    # 界面 + 站点管理 + 两段
 
 ---
 
-## 8. 常见问题
+## 9. 常见问题
 
 **Q：为什么要点两次，不能一键搞定？**
 因为「能列出的模型」和「你真要用的模型」经常不是同一个。一键模式只能替你猜（批量模式仍在用猜的），
@@ -279,7 +371,7 @@ python api_probe.py --uitest                    # 界面 + 站点管理 + 两段
 
 ---
 
-## 9. 典型用法
+## 10. 典型用法
 
 **场景一：新买了一个中转站，想确认是不是真货**
 1. ＋ 添加站点（名称随便起，比如 `cn2`），把地址和 Key 填进去
@@ -308,7 +400,7 @@ python api_probe.py --url https://your-relay.com/v1 --key sk-xxx --list-only --j
 
 ---
 
-## 10. 能力边界（做不到什么）
+## 11. 能力边界（做不到什么）
 
 | 做不到 | 说明 |
 | --- | --- |
@@ -318,17 +410,27 @@ python api_probe.py --url https://your-relay.com/v1 --key sk-xxx --list-only --j
 | ❌ 查余额 / 额度 | 各家中转站余额接口五花八门，目前只看"能不能通" |
 | ❌ 并发压测 | 单次最小请求，反映连通性与模型真实性，不代表吞吐能力 |
 | ❌ 非 Windows 平台的加密存储 | DPAPI 是 Windows 专有；其他平台会退回明文存储（配置里 `key_encrypted: false`） |
+| ❌ 让 Claude Code 接上只支持 OpenAI 协议的站 | 那种站必须先有协议转换层（cc-switch / claude-code-router 之类），本工具只能明确告诉你"接不上" |
+| ❌ 替你安装 Claude Code CLI | 只做检测与配置；CLI 请用官方安装器或 `npm i -g @anthropic-ai/claude-code` |
 
 ---
 
-## 11. 文件清单
+## 12. 文件清单
 
 | 文件 | 说明 |
 | --- | --- |
-| `api_probe.py` | 全部功能（核心探测 + 站点管理 + 图形界面 + 自检），单文件 |
+| `api_probe.py` | 全部功能（核心探测 + 站点管理 + Claude Code 接入 + 图形界面 + 自检），单文件 |
 | `启动.bat` | 双击启动图形界面（纯 ASCII，勿加中文） |
-| `自检.bat` | 跑 52 项核心逻辑自检（纯 ASCII）；界面/流程自检用 `python api_probe.py --uitest`（65 项） |
+| `自检.bat` | 跑 97 项核心逻辑自检（纯 ASCII）；界面/流程自检用 `python api_probe.py --uitest`（84 项） |
 | `打包exe.bat` | 用 PyInstaller 打成单文件 exe（纯 ASCII） |
 | `README.md` | 本文档 |
 
-版本 v1.3.0（多站点管理：可添加多个中转站互相切换；配置自动迁移到 v3）
+运行时另外会产生（都在用户目录，不在本仓库）：
+
+| 路径 | 内容 |
+| --- | --- |
+| `~/.api_probe.json` | 站点列表与设置（Key 加密） |
+| `~/.claude/settings.json` | Claude Code 配置（本工具只合并 `ANTHROPIC_*` 键，改前自动备份） |
+| `~/.api_probe/claude-code-<站点>/` | 生成的启动脚本与隔离配置目录 |
+
+版本 v1.4.0（新增 Claude Code CLI 一键接入：通道检测 / 模型映射 / 写配置 / 端到端验证）
