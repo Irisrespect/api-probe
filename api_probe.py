@@ -1,9 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-API 中转站测活工具 (API Probe)  v1.4.0
+API 中转站测活工具 (API Probe)  v1.5.0
 =====================================================================
 单文件、零第三方依赖的 Windows 桌面小工具（Python 3.9+，自带 tkinter 即可运行）
+
+工作流程（一条线走到底）
+------------------------
+    输入 API 地址 + Key（或从站点下拉选一个已保存的站点）
+        ↓
+    ① 获取模型列表      只读探测：站点指纹、协议族、真实模型清单
+        ↓
+    ② 对选中模型发测试  真发一次最小对话：能不能出字、首字多快（流畅度）
+        ↓
+    ③ 接入 Claude Code  检测 /v1/messages → 映射模型别名 → 写配置 → 端到端验证
+
+    顶部有「▶ 全流程（探测 → 测速 → 接入）」一键跑完前三步；
+    「一键接入」有硬门禁：② 生成测试通过 且 ③ 通道探测通过 才可点（按钮旁会写明缺哪一步）。
 
 多站点管理
 ----------
@@ -12,26 +25,15 @@ API 中转站测活工具 (API Probe)  v1.4.0
       编辑 / 删除   对当前选中的站点操作
       ✎ 自定义（临时）  内置的一格，不参与站点列表，但同样记住你敲进去的内容
     切换站点会自动带出该站的地址与 Key；正在编辑的内容会先存回原来那一格。
-    加完站点还能一键导入批量列表做巡检。
 
-Claude Code 一键接入（v1.4 新增）
---------------------------------
-    Claude Code CLI 2.x 支持直连第三方网关，本工具把「检测 → 配置 → 验证」串成一步：
-      ① 检测 /v1/messages   依次试 Authorization: Bearer 与 x-api-key，
-                            并补一次流式测试（CLI 全程走流式）
-      ② 模型映射            sonnet/opus/haiku/fable 别名 → 网关真实模型 id（不做映射必 404）
-      ③ 一键接入            可多选：写 ~/.claude/settings.json（合并 + 自动备份）/
-                            生成启动脚本（不落盘 Key）/ 生成隔离配置目录（CLAUDE_CONFIG_DIR）
-      ④ 端到端验证          在空的隔离配置目录里跑 claude -p PONG，证明整条链路真的通
+Claude Code 接入细节
+--------------------
+      检测通道       依次试 Authorization: Bearer 与 x-api-key，并补流式测试（CLI 全程走流式）
+      模型映射       sonnet/opus/haiku/fable 别名 → 网关真实模型 id（不做映射必 404）
+      一键接入       可多选：写 ~/.claude/settings.json（合并 + 自动备份）/
+                     生成启动脚本（不落盘 Key）/ 生成隔离配置目录（CLAUDE_CONFIG_DIR）
+      端到端验证     在空的隔离配置目录里跑 claude -p PONG，证明整条链路真的通
     前提：CLI 需 2.x；网关必须实现 Anthropic Messages 协议（只提供 OpenAI 协议的站无法直连）。
-
-工作流程（两段式，中间由你决定测哪个模型）
-------------------------------------------
-    第 ① 步  选好站点 → 点「获取模型列表」
-              → 探测站点指纹、自动识别协议族（OpenAI / Anthropic / Gemini）
-              → 拉回模型列表填进表格（此步不发任何生成请求）
-    第 ② 步  在列表里挑一个模型（双击直接测，或选中后点按钮）
-              → 发一次最小对话，测首字延迟、比对返回模型、校验 usage
 
 配置持久化（~/.api_probe.json，config_version 3）
 ------------------------------------------------
@@ -39,14 +41,13 @@ Claude Code 一键接入（v1.4 新增）
     * 加密保存：各站点的 Key 与批量列表 —— 仅在勾选「记住 Key」时写入，
       且用 Windows DPAPI 按当前用户加密（同一台机器的同一个用户才能解开）
     * 旧版（v1/v2）配置会自动迁移：原来那个地址会变成一个名为「默认站点」的站点
-    * 随时可用「清除已存 Key」抹掉文件中的凭据；取消勾选「记住 Key」也会立即清空
 
 功能
 ----
 1. 连通性测试：HTTP 状态、各阶段耗时、错误原文
 2. 协议自动识别：OpenAI 兼容 / Anthropic / Gemini，自动选择端点与鉴权头
 3. 模型列表：表格化展示、过滤、只看主流、复制、导出
-4. 真实生成测试：流式最小对话，测「首字延迟」，验证是否真能出字
+4. 真实生成测试：流式最小对话，测「首字延迟」与流畅度
 5. 掺水鉴别：请求模型 vs 返回模型比对、异常低延迟、usage 缺失、模型不在列表等信号
 6. 站点指纹：探测 /api/status 与首页 title，识别是否 New API / one-api / Veloera 系面板
 7. 批量测试多站（可一键从站点列表导入）+ 导出 CSV / JSON
@@ -90,7 +91,7 @@ import zlib
 from pathlib import Path
 
 APP_NAME = "API 中转站测活工具"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) api-probe/1.0"
 DEFAULT_TIMEOUT = 20.0
 CONFIG_PATH = Path.home() / ".api_probe.json"
@@ -1370,21 +1371,27 @@ def check_anthropic_channel(base: str, key: str, model: str = "",
         res.update(status=r.status, error=msg, latency_ms=r.latency_ms)
         break
 
-    # 流式测试（需要已知可用模型）
+    # 流式测试（需要已知可用模型）。实测发现有些网关会偶发断连（RemoteDisconnected），
+    # 但 CLI 本身仍能跑通，所以探两次再下结论，避免误判。
     if res["ok"] and res["model_used"] and not (stop_event is not None and stop_event.is_set()):
-        L(f"  流式测试 POST {url}（stream=true）")
-        col = stream_generate(url, claude_auth_headers(res["auth_style"], key),
-                              claude_ping_payload(res["model_used"], stream=True),
-                              feed_anthropic, timeout=timeout, verify=verify,
-                              stop_event=stop_event)
-        res["stream_ok"] = col.first_ms is not None
-        res["first_ms"] = col.first_ms
-        if col.error:
-            res["stream_error"] = col.error
-        if col.text:
-            res["reply"] = res["reply"] or col.text[:240]
-        L(f"  流式结果：{'首字 %.0fms' % col.first_ms if col.first_ms else '失败'}"
-          + (f"（{col.error}）" if col.error else ""))
+        stream_timeout = max(10.0, min(timeout, 30.0))
+        for attempt in (1, 2):
+            L(f"  流式测试 POST {url}（stream=true，第 {attempt} 次）")
+            col = stream_generate(url, claude_auth_headers(res["auth_style"], key),
+                                  claude_ping_payload(res["model_used"], stream=True),
+                                  feed_anthropic, timeout=stream_timeout, verify=verify,
+                                  stop_event=stop_event)
+            res["stream_ok"] = col.first_ms is not None
+            res["first_ms"] = col.first_ms
+            if col.text:
+                res["reply"] = res["reply"] or col.text[:240]
+            if res["stream_ok"]:
+                L(f"  流式通过：首字 {col.first_ms:.0f}ms")
+                break
+            res["stream_error"] = col.error or "未收到流式数据"
+            L(f"  第 {attempt} 次流式未通过：{res['stream_error']}")
+            if attempt == 1 and not (stop_event is not None and stop_event.is_set()):
+                time.sleep(1.0)
 
     # 结论
     if res["ok"]:
@@ -1393,7 +1400,10 @@ def check_anthropic_channel(base: str, key: str, model: str = "",
                               f"非流式 {res['latency_ms']:.0f}ms / 首字 {res['first_ms']:.0f}ms")
             res["verdict_level"] = "ok"
         else:
-            res["verdict"] = f"非流式可用（认证 {res['auth_style']}），但流式未通过 —— CLI 会走流式，建议换渠道"
+            res["verdict"] = (f"非流式可用（认证 {res['auth_style']}），但两次流式探测都没拿到数据"
+                              f"（{res.get('stream_error') or '未知原因'}）"
+                              "—— 可能是站点限流/瞬时抖动，也可能 SSE 未完整实现；"
+                              "CLI 未必不能用，建议直接跑一次端到端验证")
             res["verdict_level"] = "warn"
     elif res["model_not_found"]:
         res["verdict"] = (f"认证通过，但模型「{res['model_used']}」在该网关不可用"
@@ -1416,6 +1426,19 @@ def check_anthropic_channel(base: str, key: str, model: str = "",
     return res
 
 
+def evaluate_fluency(first_ms, stream_ok: bool) -> tuple[str, str]:
+    """按首字延迟给个「流畅度」判断，返回 (level, 文案)。"""
+    if not stream_ok or first_ms is None:
+        return "warn", "未拿到流式首字，无法判断流畅度"
+    if first_ms < 1000:
+        return "ok", f"流畅（首字 {first_ms:.0f}ms）"
+    if first_ms < 3000:
+        return "ok", f"良好（首字 {first_ms:.0f}ms）"
+    if first_ms < 8000:
+        return "warn", f"偏慢（首字 {first_ms:.0f}ms）"
+    return "warn", f"很慢（首字 {first_ms:.0f}ms），日常用会明显卡顿"
+
+
 def suggest_claude_model_map(models: list[dict], fallback: str = "") -> dict:
     """从站点模型列表猜 sonnet/opus/haiku/fable 该映射到哪个真实 id。"""
     ids = [str(m.get("id") or "") for m in (models or []) if m.get("id")]
@@ -1428,6 +1451,93 @@ def suggest_claude_model_map(models: list[dict], fallback: str = "") -> dict:
     default = out.get("sonnet") or fallback or (choose_default_model(models) if models else "")
     if default:
         out["default"] = default
+    return out
+
+
+def run_full_pipeline(base_input: str, key: str, model: str = "",
+                      timeout: float = DEFAULT_TIMEOUT, verify: bool = True, deep: bool = True,
+                      log=None, stop_event: threading.Event | None = None) -> dict:
+    """一条龙走完用户的四步流程：
+
+        ① 探测模型列表
+        ② 生成测试（能不能真的跑、跑得流不流畅）
+        ③ 检测 Anthropic 通道 /v1/messages（Claude Code 的前提）
+        ④ 给出模型映射建议（sonnet/opus/haiku/fable → 网关真实 id）
+
+    返回 {"site","gen","channel","model_map","steps","fluency","ok","verdict",...}。
+    不做任何写入动作 —— 写配置由 GUI 的「一键接入」显式触发。
+    """
+    def L(msg):
+        if log:
+            log(msg)
+
+    out = {"site": {}, "gen": {}, "channel": {}, "model_map": {}, "used_model": "",
+           "fluency_level": "", "fluency": "", "ok": False, "stopped": False,
+           "steps": [], "verdict": ""}
+
+    def step(no, text, ok=None, detail=""):
+        out["steps"].append({"no": no, "text": text, "ok": ok, "detail": detail})
+        L(f"[{no}/4] {text}" + (f" → {detail}" if detail else ""))
+
+    L("=" * 62)
+    L(f"[1/4] 探测模型列表：{base_input}")
+    site = probe_site(base_input, key, timeout=timeout, verify=verify, log=log,
+                      stop_event=stop_event)
+    out["site"] = site
+    base = site.get("base") or ""
+    if not base:
+        out["verdict"] = site.get("verdict") or "地址无效"
+        step(1, "探测模型列表", False, out["verdict"])
+        return out
+    if stop_event is not None and stop_event.is_set():
+        out.update(stopped=True, verdict="已手动停止")
+        return out
+    step(1, "探测模型列表", bool(site.get("ok_site")),
+         f"{site.get('protocol_label') or '-'}，{site.get('model_count', 0)} 个模型")
+
+    used = (model or "").strip() or choose_default_model(site.get("models") or [])
+    out["used_model"] = used
+    if used:
+        L(f"[2/4] 生成测试（模型 {used}）")
+        gen = probe_generate(site, key, used, timeout=timeout, verify=verify, deep=deep,
+                             log=log, stop_event=stop_event)
+        out["gen"] = gen
+        lvl, txt = evaluate_fluency(gen.get("first_token_ms"), bool(gen.get("stream_ok")))
+        out["fluency_level"], out["fluency"] = lvl, txt
+        step(2, f"生成测试（模型 {used}）", bool(gen.get("ok")), txt)
+    else:
+        step(2, "生成测试", False, "没有可用模型，请在「指定模型」里手写一个再试")
+
+    if stop_event is not None and stop_event.is_set():
+        out.update(stopped=True, verdict="已手动停止")
+        return out
+
+    L("[3/4] 检测 /v1/messages 通道")
+    ch = check_anthropic_channel(base, key, used, timeout=timeout, verify=verify, log=log,
+                                 stop_event=stop_event)
+    out["channel"] = ch
+    step(3, "检测 /v1/messages 通道", bool(ch.get("ok")),
+         (f"认证方式 {ch['auth_style']}" if ch.get("auth_style") else "")
+         or ch.get("verdict", ""))
+
+    mm = suggest_claude_model_map(site.get("models") or [], fallback=used)
+    out["model_map"] = mm
+    step(4, "生成模型映射建议", bool(mm),
+         "、".join(f"{k}→{v}" for k, v in mm.items()) or "没匹配到 claude 系模型")
+
+    gen_ok = bool(out["gen"].get("ok"))
+    ch_ok = bool(ch.get("ok")) or bool(ch.get("model_not_found"))
+    out["ok"] = gen_ok and ch_ok
+    bits = ["模型可用" if gen_ok else "生成测试未通过"]
+    if ch.get("ok"):
+        bits.append("Anthropic 通道可用")
+    elif ch.get("model_not_found"):
+        bits.append("Anthropic 通道认证通过（模型映射后即可用）")
+    else:
+        bits.append("Anthropic 通道不可用")
+    out["verdict"] = ("全流程" + ("通过：" if out["ok"] else "未完全通过：") + "；".join(bits)
+                      + (f"；{out['fluency']}" if out["fluency"] else ""))
+    L(f"流程结论：{out['verdict']}")
     return out
 
 
@@ -1734,6 +1844,7 @@ class ProbeApp:
         self._setup_style()
         self._build_ui()
         self._load_config()
+        self._refresh_cc_gate()                   # 启动时接入按钮是锁着的
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(80, self._pump)
 
@@ -1834,10 +1945,13 @@ class ProbeApp:
         self.btn_gen = ttk.Button(btns, text="②  对选中模型发测试", command=self.run_generation,
                                   state="disabled")
         self.btn_gen.pack(side="left", padx=6)
+        ttk.Button(btns, text="③  接入 Claude Code",
+                   command=self.goto_claude_tab).pack(side="left", padx=6)
+        self.btn_flow = ttk.Button(btns, text="▶  全流程（探测 → 测速 → 接入）",
+                                   command=self.run_full_flow)
+        self.btn_flow.pack(side="left", padx=(14, 4))
         self.btn_stop = ttk.Button(btns, text="■  停止", command=self.stop, state="disabled")
         self.btn_stop.pack(side="left", padx=6)
-        ttk.Button(btns, text="⇢ 接入 Claude Code",
-                   command=self.goto_claude_tab).pack(side="left", padx=(14, 4))
         ttk.Button(btns, text="复制结论", command=self.copy_verdict).pack(side="left", padx=(18, 4))
         ttk.Button(btns, text="导出 JSON", command=lambda: self.export_last("json")).pack(side="left", padx=4)
         ttk.Button(btns, text="导出 CSV", command=lambda: self.export_last("csv")).pack(side="left", padx=4)
@@ -1980,11 +2094,11 @@ class ProbeApp:
 
         # ---- 通道检测 ----
         head = ttk.LabelFrame(
-            frame, text=" 前提：网关要实现 Anthropic Messages 协议（POST <BASE>/v1/messages）；CLI 需 2.x ")
+            frame, text=" ③ 接入 Claude Code —— 前提：网关实现 Anthropic Messages 协议（POST <BASE>/v1/messages）；CLI 需 2.x ")
         head.pack(fill="x", padx=6, pady=(6, 4))
         r1 = ttk.Frame(head)
         r1.pack(fill="x", padx=8, pady=(6, 2))
-        self.btn_cc_check = ttk.Button(r1, text="①  检测通道 /v1/messages", command=self.cc_check)
+        self.btn_cc_check = ttk.Button(r1, text="检测通道 /v1/messages", command=self.cc_check)
         self.btn_cc_check.pack(side="left")
         ttk.Label(r1, text="（用当前选中站点的地址与 Key；先过这一步再写配置）",
                   style="Hint.TLabel").pack(side="left", padx=6)
@@ -2049,8 +2163,11 @@ class ProbeApp:
         self.lbl_cc_target.pack(side="right")
         r5 = ttk.Frame(act)
         r5.pack(fill="x", padx=8, pady=(0, 8))
-        self.btn_cc_install = ttk.Button(r5, text="▶  一键接入", command=self.cc_install)
+        self.btn_cc_install = ttk.Button(r5, text="▶  一键接入", command=self.cc_install,
+                                         state="disabled")
         self.btn_cc_install.pack(side="left")
+        self.lbl_cc_gate = ttk.Label(r5, text="", style="Hint.TLabel")
+        self.lbl_cc_gate.pack(side="left", padx=8)
         ttk.Button(r5, text="仅预览配置", command=self.cc_preview).pack(side="left", padx=4)
         ttk.Button(r5, text="复制临时命令", command=self.cc_copy_oneliner).pack(side="left", padx=4)
         ttk.Button(r5, text="恢复上次备份", command=self.cc_restore).pack(side="left", padx=(14, 4))
@@ -2083,6 +2200,96 @@ class ProbeApp:
                                background="#111827", foreground="#e5e7eb", insertbackground="#e5e7eb")
         self.txt_log.pack(fill="both", expand=True, padx=6, pady=6)
 
+    # ---------------- 全流程（探测 → 测速 → 接入） ----------------
+    def run_full_flow(self):
+        """按用户要的顺序一条龙：输入地址+Key → 探测模型 → 测是否跑得动/流不流畅 → 准备接入 Claude Code。"""
+        if self.busy:
+            self._set_status("正在测试中，请稍候…")
+            return
+        base = self.var_url.get().strip()
+        if not base:
+            self._set_status("请先填写 API 地址")
+            return
+        key = self.var_key.get().strip()
+        model = self.var_model.get().strip()
+        if not model and self.cc_model_vars:
+            model = self.cc_model_vars["default"][0].get().strip()
+        self.stop_event.clear()
+        self._save_config()
+        self._log_clear()
+        self.busy = True
+        self.btn_list.configure(state="disabled")
+        self.btn_gen.configure(state="disabled")
+        self.btn_batch.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
+        self._set_cc_busy(True)
+        self.tv_ov.delete(*self.tv_ov.get_children())
+        self.tv_models.delete(*self.tv_models.get_children())
+        self.tv_cc.delete(*self.tv_cc.get_children())
+        self.site_result = None
+        self.last_result = None
+        self.cc_state = {}
+        self._set_status("全流程进行中…")
+        self.lbl_summary.configure(text=f"全流程：{base}")
+        self._cc_log_append("=" * 52)
+        self._cc_log_append(f"全流程开始：{base}（模型 {model or '自动挑一个'}）")
+        self._log_append(f"=== 全流程开始 {base} ===")
+        timeout = self._timeout()
+        verify = bool(self.var_verify.get())
+        deep = bool(self.var_deep.get())
+
+        def work():
+            try:
+                res = run_full_pipeline(base, key, model, timeout=timeout, verify=verify,
+                                        deep=deep, log=self._log, stop_event=self.stop_event)
+                self.q.put(("flow_done", res))
+            except Exception as e:  # noqa: BLE001
+                self.q.put(("fatal", f"{type(e).__name__}: {e}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _render_flow(self, res: dict):
+        site = res.get("site") or {}
+        gen = res.get("gen") or site
+        ch = res.get("channel") or {}
+        if site:
+            self.site_result = site
+            self.last_result = site
+            self._site_signature = self._signature()
+            self._refresh_models()
+            self.lbl_models.configure(text=f"共 {len(site.get('models') or [])} 个模型")
+        self._render_overview(gen if gen else site)
+        self.cc_state = ch
+        if ch:
+            self._render_cc_check(ch)
+        ids = [str(m.get("id") or "") for m in (site.get("models") or []) if m.get("id")]
+        mm = res.get("model_map") or {}
+        for k, (var, cmb) in self.cc_model_vars.items():
+            cmb.configure(values=ids)
+            if mm.get(k):
+                var.set(mm[k])
+        cli = find_claude_cli()
+        self.lbl_cc_cli.configure(text=("CLI：" + cli) if cli
+                                  else "没找到 claude 命令（端到端验证会跳过）")
+        for s in res.get("steps", []):
+            mark = {True: "✔", False: "✘"}.get(s.get("ok"), "·")
+            self._cc_log_append(f"{mark} [{s['no']}/4] {s['text']}"
+                                + (f" → {s['detail']}" if s.get("detail") else ""))
+        self._cc_log_append(f"结论：{res.get('verdict', '')}")
+        self.nb.select(self.tab_claude)
+        self._set_status("全流程完成" if res.get("ok") else "全流程完成（有未通过项，见日志）")
+        self.lbl_summary.configure(text=res.get("verdict", ""))
+        self._log_append(f"=== 全流程完成：{res.get('verdict', '')} ===")
+        self._finish_busy()
+        if res.get("ok") and self.cc_write_settings.get() and not res.get("stopped"):
+            from tkinter import messagebox
+            if messagebox.askyesno(
+                    "全流程通过",
+                    "模型能跑、Anthropic 通道也通了。\n\n"
+                    "现在把这套配置写进 Claude Code 吗？\n"
+                    "（合并进 ~/.claude/settings.json，改前自动备份）"):
+                self.cc_install()
+
     # ---------------- Claude Code 接入 ----------------
     def _open_path(self, path) -> None:
         p = Path(path)
@@ -2104,13 +2311,50 @@ class ProbeApp:
         self.txt_cc.insert("end", f"{time.strftime('%H:%M:%S')}  {msg}\n")
         self.txt_cc.see("end")
 
+    def cc_ready(self) -> tuple[bool, str]:
+        """门禁：只有第 ② 步生成测试通过 + Anthropic 通道探测通过，才允许「一键接入」。
+
+        返回 (是否可以接入, 不可以的原因)。
+        """
+        gen_ok = bool((self.site_result or {}).get("ok"))
+        ch = self.cc_state or {}
+        if not gen_ok:
+            return False, "第 ② 步生成测试还没通过：先点「② 对选中模型发测试」或「▶ 全流程」"
+        if ch.get("ok"):
+            return True, ""
+        if ch.get("model_not_found"):
+            return False, "通道认证通过但模型不可用：先在下面做好模型映射，再点「检测通道」复测"
+        if ch:
+            return False, f"Anthropic 通道未通过：{ch.get('verdict') or '未知原因'}"
+        return False, "还没检测 Anthropic 通道：先点「检测通道 /v1/messages」或「▶ 全流程」"
+
+    def _refresh_cc_gate(self) -> None:
+        ok, why = self.cc_ready()
+        try:
+            self.btn_cc_install.configure(state="normal" if ok else "disabled")
+        except Exception:
+            pass
+        try:
+            self.lbl_cc_gate.configure(
+                text="已解锁，可以接入" if ok else f"未解锁：{why}",
+                foreground=COLORS["ok"] if ok else COLORS["muted"])
+        except Exception:
+            pass
+
     def _set_cc_busy(self, flag: bool) -> None:
         state = "disabled" if flag else "normal"
-        for btn in (getattr(self, "btn_cc_check", None), getattr(self, "btn_cc_install", None)):
+        for btn in (getattr(self, "btn_cc_check", None), getattr(self, "btn_flow", None)):
             try:
                 btn.configure(state=state)
             except Exception:
                 pass
+        if flag:
+            try:
+                self.btn_cc_install.configure(state="disabled")
+            except Exception:
+                pass
+        else:
+            self._refresh_cc_gate()          # 空闲时按门禁决定「一键接入」是否可点
 
     def goto_claude_tab(self):
         self.nb.select(self.tab_claude)
@@ -2243,18 +2487,21 @@ class ProbeApp:
         if self.busy:
             self._set_status("正在测试中，请稍候…")
             return
+        # 硬门禁：必须先生成测试 + 通道检测都通过
+        ready, why = self.cc_ready()
+        if not ready:
+            self._set_status(why)
+            try:
+                messagebox.showwarning("还不能接入 Claude Code", why)
+            except Exception:
+                pass
+            return
         env, _style = self.cc_build_env()
         if not env.get("ANTHROPIC_BASE_URL"):
             self._set_status("请先填写 API 地址")
             return
         if not any(k in env for k in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")):
             if not messagebox.askyesno("没有 Key", "当前没填 Key，写进配置后 CLI 无法认证。仍要继续？"):
-                return
-        if not (self.cc_state or {}).get("ok"):
-            if not messagebox.askyesno(
-                    "还没确认通道",
-                    "建议先点「① 检测通道 /v1/messages」，确认这个网关支持 Anthropic 协议。\n\n"
-                    "（只提供 OpenAI 协议的中转站，Claude Code 无法直连）\n\n现在直接写配置吗？"):
                 return
         do_settings = bool(self.cc_write_settings.get())
         do_launcher = bool(self.cc_write_launcher.get())
@@ -2312,9 +2559,15 @@ class ProbeApp:
                              f"terminal_reason={vr['terminal_reason'] or '-'} "
                              f"模型={list(vr['model_usage'].keys()) or '-'}")
                     else:
+                        hint = ""
+                        low = (vr["error"] or "").lower()
+                        if vr["status"] == "404" or "model" in low or "not exist" in low:
+                            hint = "　→ 大概率是模型映射不对：点「从当前站点模型列表自动匹配」再重试"
+                        elif vr["status"] in ("401", "403"):
+                            hint = "　→ 鉴权失败：确认这个 Key 对当前站点有效"
                         note(f"✘ 端到端验证未通过：{vr['error']}"
-                             + (f"（api_error_status={vr['status']}）" if vr["status"] else ""),
-                             ok=False)
+                             + (f"（api_error_status={vr['status']}）" if vr["status"] else "")
+                             + hint, ok=False)
                 self.q.put(("cc_install_done", summary))
             except Exception as e:  # noqa: BLE001
                 self.q.put(("fatal", f"{type(e).__name__}: {e}"))
@@ -2407,6 +2660,7 @@ class ProbeApp:
         self.tv_ov.delete(*self.tv_ov.get_children())
         self.tv_models.delete(*self.tv_models.get_children())
         self.lbl_models.configure(text="（尚未获取列表）")
+        self._refresh_cc_gate()               # 站点一变，接入门禁立刻关上
         try:
             self.nb.select(0)
         except Exception:
@@ -2993,6 +3247,8 @@ class ProbeApp:
                     self._render_cc_check(data)
                 elif kind == "cc_install_done":
                     self._finish_cc_install(data)
+                elif kind == "flow_done":
+                    self._render_flow(data)
                 elif kind == "batch_row":
                     res, done, total = data
                     self._append_batch_row(res, done, total)
@@ -3085,6 +3341,9 @@ class ProbeApp:
             add("返回模型", got, "ok" if same else ("risk" if res.get("returned_model") else "muted"))
             add("首字延迟", f"{res['first_token_ms']:.0f} ms"
                 if res.get("first_token_ms") is not None else "-")
+            lvl_f, txt_f = evaluate_fluency(res.get("first_token_ms"),
+                                            bool(res.get("stream_ok")))
+            add("流畅度", txt_f, lvl_f)
             add("生成总耗时", f"{res.get('gen_ms')} ms" if res.get("gen_ms") else "-")
             usage = res.get("usage")
             if isinstance(usage, dict):
@@ -3652,6 +3911,39 @@ def selftest() -> int:
 
     sample = [{"id": x} for x in ["claude-fable-5-1", "claude-haiku-4-5-20251001",
                                   "claude-opus-5-5", "claude-sonnet-5-5", "gpt-4o"]]
+
+    lv1, tx1 = evaluate_fluency(620, True)
+    lv2, tx2 = evaluate_fluency(4200, True)
+    lv3, tx3 = evaluate_fluency(None, False)
+    check("流畅度：快 → ok", lv1 == "ok" and "流畅" in tx1, f"-> {tx1}")
+    check("流畅度：慢 → warn", lv2 == "warn" and "偏慢" in tx2, f"-> {tx2}")
+    check("流畅度：没拿到首字 → warn", lv3 == "warn", f"-> {tx3}")
+
+    srv, base = _mock_server("anthropic")
+    try:
+        pipe = run_full_pipeline(base, "sk-mock", timeout=10, deep=False)
+        check("全流程：拿到 4 个模型", (pipe["site"] or {}).get("model_count") == 4,
+              f"-> {(pipe['site'] or {}).get('model_count')}")
+        check("全流程：生成测试通过", (pipe["gen"] or {}).get("ok") is True,
+              f"-> {(pipe['gen'] or {}).get('verdict')}")
+        check("全流程：Anthropic 通道通过", (pipe["channel"] or {}).get("ok") is True,
+              f"-> {(pipe['channel'] or {}).get('verdict')}")
+        check("全流程：给出模型映射", pipe["model_map"].get("sonnet") == "claude-sonnet-5-5",
+              f"-> {pipe['model_map']}")
+        check("全流程：四步都记录了", len(pipe["steps"]) == 4, f"-> {pipe['steps']}")
+        check("全流程：结论为通过", pipe["ok"] is True, f"-> {pipe['verdict']}")
+        check("全流程：带上了流畅度", bool(pipe["fluency"]), f"-> {pipe['fluency']}")
+    finally:
+        srv.shutdown()
+
+    srv, base = _mock_server("openaionly")
+    try:
+        pipe2 = run_full_pipeline(base, "sk-mock", timeout=10, deep=False)
+        check("只有 OpenAI 协议时全流程判为未通过", pipe2["ok"] is False, f"-> {pipe2['verdict']}")
+        check("此时模型测试本身是通过的", (pipe2["gen"] or {}).get("ok") is True)
+    finally:
+        srv.shutdown()
+
     mm = suggest_claude_model_map(sample)
     check("sonnet 映射到 claude-sonnet-5-5", mm.get("sonnet") == "claude-sonnet-5-5", f"-> {mm}")
     check("opus 映射到 claude-opus-5-5", mm.get("opus") == "claude-opus-5-5")
@@ -4002,10 +4294,26 @@ def uitest() -> int:
             check("候选下拉里带上了模型 id",
                   "claude-opus-5-5" in list(app.cc_model_vars["opus"][1].cget("values")))
 
+            # 门禁：生成测试没过之前，接入按钮必须是禁用的
+            check("门禁：只拉了列表还不能接入", app.cc_ready()[0] is False,
+                  f"-> {app.cc_ready()[1]}")
+            check("接入按钮默认禁用", str(app.btn_cc_install["state"]) == "disabled")
+            app.var_model.set("claude-sonnet-5-5")
+            app.run_generation()
+            wait_until(lambda: not app.busy, root)
+            check("生成测试通过", (app.site_result or {}).get("ok") is True,
+                  f"-> {(app.site_result or {}).get('verdict')}")
+            check("门禁：还缺通道检测，仍不可接入", app.cc_ready()[0] is False,
+                  f"-> {app.cc_ready()[1]}")
+            check("接入按钮仍然禁用", str(app.btn_cc_install["state"]) == "disabled")
+
             app.cc_check()
             wait_until(lambda: not app.busy, root)
             check("界面里的通道检测通过", (app.cc_state or {}).get("ok") is True,
                   f"-> {(app.cc_state or {}).get('verdict')}")
+            check("门禁：两项都通过后解锁", app.cc_ready()[0] is True, f"-> {app.cc_ready()[1]}")
+            check("接入按钮已可点", str(app.btn_cc_install["state"]) == "normal",
+                  f"-> {app.btn_cc_install['state']}")
             check("检测结果渲染到表格", len(app.tv_cc.get_children()) >= 5,
                   f"-> {len(app.tv_cc.get_children())}")
             check("检测到流式可用", (app.cc_state or {}).get("stream_ok") is True)
