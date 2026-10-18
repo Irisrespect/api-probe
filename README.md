@@ -19,7 +19,7 @@
 | 6 | 批量巡检 | 一次跑一堆站点，并发可调，导出 CSV/JSON 做横向对比 |
 | 7 | 持久化与安全 | 站点信息明文存、Key 用 Windows DPAPI 按用户加密，可一键清除 |
 | 8 | 命令行/自动化 | `--list-only` / `--model` / `--json`，退出码 0/2 可接 CI 或计划任务 |
-| 9 | 自检 | 本地 mock 服务器，核心 148 项 + 界面流程 109 项断言，不碰你的真实配置、`~/.claude` 与 `~/.codex` |
+| 9 | 自检 | 本地 mock 服务器，核心 148 项 + 界面流程 111 项断言，不碰你的真实配置、`~/.claude` 与 `~/.codex` |
 | 10 | **Claude Code 一键接入** | 检测 /v1/messages 通道 → 映射模型别名 → 写 settings.json / 生成启动脚本 → 端到端跑通 `claude -p PONG`；**没跑通就不让点接入** |
 | 11 | **Codex 一键接入（OpenAI 格式）** | 检测 `/v1/responses` 与 `/v1/chat/completions` 决定 `wire_api` → 选 GPT 模型 → 合并 `~/.codex/config.toml` + 写 `.env` → 端到端跑通 `codex exec PONG`；同样有门禁 |
 
@@ -71,15 +71,21 @@ API Key  [ sk-••••••••••••                              
 
 ### 接入按钮有门禁
 
-每个页面的「一键接入」默认都是**灰色不可点**的，各自要同时满足两个条件才解锁：
+每个页面的「一键接入」默认都是**灰色不可点**的，解锁条件是**对应通道实测可用**：
 
-| 页面 | 条件 1 | 条件 2 |
-| --- | --- | --- |
-| Claude Code | ② 生成测试通过 | Anthropic `/v1/messages` 通道探测通过 |
-| Codex | ② 生成测试通过 | OpenAI 通道探测通过（`/v1/responses` 或 `/v1/chat/completions`） |
+| 页面 | 解锁条件（二选一即可） |
+| --- | --- |
+| Claude Code | Anthropic `/v1/messages` 探测通过 |
+| Codex | OpenAI 通道探测通过（`/v1/responses` 或 `/v1/chat/completions`） |
 
-没解锁时按钮旁边会写明**缺哪一步**（例如「未解锁：第 ② 步生成测试还没通过…」）。
-换站点、改地址或改 Key 会立刻把两边的门禁一起锁上——避免拿 A 站的结果去写 B 站的配置。
+为什么这样就够：**通道探测本身就是一次真实的最小生成**（发一句 `Reply with exactly: PONG` 并拿到回复），
+所以"探测通过" = "它刚刚真的跑成功了一次"。第 ② 步的生成测试走的是工具自己挑的协议路径，
+与 CLI 实际使用的路径不一定重合（例如只代理 Anthropic 的站，② 会失败但 Claude Code 完全可用），
+因此 ② 只作为**提示**：通道过了而 ② 没过时按钮照样解锁，但旁边会写明
+「注意：第 ② 步生成测试未通过，但 Claude Code 用的 /v1/messages 已实测可用」。
+
+没解锁时按钮旁边会写明**缺哪一步**。换站点、改地址或改 Key 会立刻把两边的门禁一起锁上——
+避免拿 A 站的结果去写 B 站的配置。
 
 `▶ 全流程` 跑完且对应通道通过时，会弹一句「现在就把这套配置写进 Claude Code / Codex 吗？」，
 点「是」才写入，且写入前自动备份。
@@ -410,7 +416,7 @@ python api_probe.py --url ... --codex-check     # 检测 OpenAI 通道，判断 
 python api_probe.py --url ... --no-verify       # 跳过 TLS 证书校验（自签证书站点）
 python api_probe.py --url ... --no-deep         # 关闭深度检测，少发一次请求
 python api_probe.py --selftest                  # 核心逻辑自检（148 项）
-python api_probe.py --uitest                    # 界面 + 站点管理 + 两段式 + 两个接入页（109 项）
+python api_probe.py --uitest                    # 界面 + 站点管理 + 两段式 + 两个接入页（111 项）
 ```
 
 退出码：`0` 成功 / `2` 失败（可直接用于脚本巡检、CI 里做连通性卡点）。

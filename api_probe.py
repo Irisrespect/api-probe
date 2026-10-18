@@ -2892,16 +2892,17 @@ class ProbeApp:
         self.txt_cc.see("end")
 
     def cc_ready(self) -> tuple[bool, str]:
-        """门禁：只有第 ② 步生成测试通过 + Anthropic 通道探测通过，才允许「一键接入」。
+        """门禁：通道探测通过即可接入 —— 它本身就是一次真实的最小生成（拿到 PONG）。
 
-        返回 (是否可以接入, 不可以的原因)。
+        第 ② 步生成测试只作为提示：它走的是工具自己挑的协议路径，
+        而 CLI 走的是 /v1/messages，两者不一定同时可用（例如只代理 Anthropic 的站）。
+        返回 (是否可以接入, 说明或不可接入的原因)。
         """
-        gen_ok = bool((self.site_result or {}).get("ok"))
         ch = self.cc_state or {}
-        if not gen_ok:
-            return False, "第 ② 步生成测试还没通过：先点「② 对选中模型发测试」或「▶ 全流程」"
+        gen_ok = bool((self.site_result or {}).get("ok"))
         if ch.get("ok"):
-            return True, ""
+            return True, ("" if gen_ok else
+                          "注意：第 ② 步生成测试未通过，但 Claude Code 用的 /v1/messages 已实测可用")
         if ch.get("model_not_found"):
             return False, "通道认证通过但模型不可用：先在下面做好模型映射，再点「检测通道」复测"
         if ch:
@@ -2912,11 +2913,9 @@ class ProbeApp:
         ok, why = self.cc_ready()
         try:
             self.btn_cc_install.configure(state="normal" if ok else "disabled")
-        except Exception:
-            pass
-        try:
             self.lbl_cc_gate.configure(
-                text="已解锁，可以接入" if ok else f"未解锁：{why}",
+                text=(("已解锁，可以接入" + (f"（{why}）" if why else "")) if ok
+                      else f"未解锁：{why}"),
                 foreground=COLORS["ok"] if ok else COLORS["muted"])
         except Exception:
             pass
@@ -3227,13 +3226,16 @@ class ProbeApp:
             self._set_status(f"已选默认模型：{pick}")
 
     def codex_ready(self) -> tuple[bool, str]:
-        """门禁：生成测试通过 + OpenAI 通道检测通过，才允许「一键接入 Codex」。"""
-        gen_ok = bool((self.site_result or {}).get("ok"))
+        """门禁：OpenAI 通道探测通过即可接入 —— 它本身就是一次真实的生成（拿到 PONG）。
+
+        第 ② 步生成测试只作提示：它走工具自己挑的协议路径，Codex 走的是
+        /v1/responses 或 /v1/chat/completions，某些只实现 responses 的网关两者并不同时可用。
+        """
         ch = self.codex_state or {}
-        if not gen_ok:
-            return False, "第 ② 步生成测试还没通过：先点「② 对选中模型发测试」或「▶ 全流程」"
+        gen_ok = bool((self.site_result or {}).get("ok"))
         if ch.get("ok"):
-            return True, ""
+            return True, ("" if gen_ok else
+                          "注意：第 ② 步生成测试未通过，但 Codex 用的通道已实测可用")
         if any(t.get("model_not_found") for t in ch.get("tried") or []):
             return False, "通道路径通了但模型不可用：换一个模型后再点「检测通道」"
         if ch:
@@ -3245,7 +3247,8 @@ class ProbeApp:
         try:
             self.btn_codex_install.configure(state="normal" if ok else "disabled")
             self.lbl_codex_gate.configure(
-                text="已解锁，可以接入" if ok else f"未解锁：{why}",
+                text=(("已解锁，可以接入" + (f"（{why}）" if why else "")) if ok
+                      else f"未解锁：{why}"),
                 foreground=COLORS["ok"] if ok else COLORS["muted"])
         except Exception:
             pass
@@ -5342,6 +5345,14 @@ def uitest() -> int:
             check("门禁：两项都通过后解锁", app.cc_ready()[0] is True, f"-> {app.cc_ready()[1]}")
             check("接入按钮已可点", str(app.btn_cc_install["state"]) == "normal",
                   f"-> {app.btn_cc_install['state']}")
+            # 通道过了但 ② 没过（例如只代理 Anthropic 的站）：应当解锁并给出提示
+            saved_gen_ok = (app.site_result or {}).get("ok")
+            app.site_result["ok"] = False
+            r_ok, r_why = app.cc_ready()
+            check("通道通过而生成测试没过时：解锁 + 提示",
+                  r_ok is True and "注意" in r_why, f"-> {r_why}")
+            app.site_result["ok"] = saved_gen_ok
+            check("恢复后仍解锁", app.cc_ready()[0] is True)
             check("检测结果渲染到表格", len(app.tv_cc.get_children()) >= 5,
                   f"-> {len(app.tv_cc.get_children())}")
             check("检测到流式可用", (app.cc_state or {}).get("stream_ok") is True)
