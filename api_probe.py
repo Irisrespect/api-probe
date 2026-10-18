@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-API 中转站测活工具 (API Probe)  v1.7.0
+API 中转站测活工具 (API Probe)  v1.8.0
 =====================================================================
 单文件、零第三方依赖的 Windows 桌面小工具（Python 3.9+，自带 tkinter 即可运行）
 
@@ -15,6 +15,7 @@ API 中转站测活工具 (API Probe)  v1.7.0
         ↓
     ③ 接入 Claude Code  检测 /v1/messages → 映射模型别名 → 写配置 → 端到端验证
     ④ 接入 Codex        检测 /v1/responses 与 /v1/chat/completions → 写 config.toml → 端到端验证
+                        （CLI 与桌面版共用 config.toml；桌面版的 Key 走用户级环境变量，改完需重启桌面版）
 
     ③④ 是两个独立页面：一页管 Anthropic 格式，一页管 OpenAI 格式，互不干扰。
     顶部有「▶ 全流程（探测 → 测速 → 接入）」一键跑完；
@@ -107,7 +108,7 @@ import zlib
 from pathlib import Path
 
 APP_NAME = "API 中转站测活工具"
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) api-probe/1.0"
 DEFAULT_TIMEOUT = 20.0
 CONFIG_PATH = Path.home() / ".api_probe.json"
@@ -2131,6 +2132,118 @@ def find_codex_backups(path: str | Path | None = None) -> list[Path]:
     return sorted(items, key=lambda q: q.stat().st_mtime, reverse=True)
 
 
+# ---------------------- Codex 桌面版（Electron / MSIX） ----------------------
+# 桌面版与 CLI 共用同一份 ~/.codex/config.toml（桌面版自己的 UI 设置也放在这份文件的
+# [desktop] 段里，足以证明它读这个文件），所以写配置对两者同时生效。
+# 但 Key 不一样：CLI 会加载 CODEX_HOME/.env，而桌面版是从**用户级环境变量**取值
+# （GUI 程序由 Explorer 启动，拿的正是 HKCU\Environment 里的变量）。
+# 另外桌面版是常驻进程，改完要重启才会重新读配置与环境变量。
+
+def read_user_env_var(name: str) -> str:
+    """读用户级环境变量（HKCU\\Environment）。"""
+    if sys.platform != "win32" or not name:
+        return ""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as k:
+            val, _ = winreg.QueryValueEx(k, name)
+            return str(val or "")
+    except FileNotFoundError:
+        return ""
+    except Exception:
+        return ""
+
+
+def set_user_env_var(name: str, value: str, persist: bool = True) -> dict:
+    """设置用户级环境变量，供 Codex 桌面版读取。
+
+    - 写 HKCU\\Environment；再广播 WM_SETTINGCHANGE，让之后新启动的程序立刻看到
+    - 同时写进当前进程环境，便于紧接着做验证
+    """
+    out = {"ok": False, "name": name, "error": "", "persisted": False}
+    if not name:
+        out["error"] = "变量名为空"
+        return out
+    os.environ[name] = str(value)
+    if sys.platform != "win32":
+        out["ok"] = True                     # 非 Windows：只影响当前进程
+        return out
+    if not persist:
+        out["ok"] = True
+        return out
+    try:
+        import winreg
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, "Environment", 0,
+                                winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, name, 0, winreg.REG_SZ, str(value))
+        out["persisted"] = True
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"写注册表失败：{e}"
+        return out
+    try:
+        import ctypes
+        HWND_BROADCAST, WM_SETTINGCHANGE, SMTO_ABORTIFHUNG = 0xFFFF, 0x1A, 0x2
+        ctypes.windll.user32.SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0,
+                                                 "Environment", SMTO_ABORTIFHUNG,
+                                                 5000, None)
+    except Exception:
+        pass                                  # 广播失败只是要等重新登录，不影响已写入的值
+    out["ok"] = True
+    return out
+
+
+def delete_user_env_var(name: str) -> bool:
+    """删掉用户级环境变量（清理用，比如测试变量）。"""
+    if sys.platform != "win32" or not name:
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0,
+                            winreg.KEY_SET_VALUE) as k:
+            winreg.DeleteValue(k, name)
+        return True
+    except Exception:
+        return False
+
+
+def codex_desktop_installed() -> bool:
+    """判断 Codex 桌面版是否装过：看它的数据目录 / 自带可执行目录 / 全局状态文件。"""
+    local = os.environ.get("LOCALAPPDATA") or ""
+    for p in (Path(local) / "Codex" / "Logs",
+              Path(local) / "OpenAI" / "Codex" / "bin",
+              Path.home() / ".codex" / ".codex-global-state.json"):
+        try:
+            if p.exists():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def launch_codex_desktop(cli_path: str = "") -> dict:
+    """拉起 Codex 桌面版（用官方 `codex app`；找不到 CLI 就报错，不猜 exe 路径）。"""
+    out = {"ok": False, "cmd": "", "error": ""}
+    cli = cli_path or find_codex_cli()
+    if not cli:
+        out["error"] = "找不到 codex 可执行文件，没法拉起桌面版（可以先手动打开）"
+        return out
+    args = [cli, "app"]
+    if cli.lower().endswith((".cmd", ".bat")):
+        args = ["cmd", "/c"] + args
+    out["cmd"] = " ".join(args)
+    try:
+        flags = 0
+        if sys.platform == "win32":
+            flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
+                     | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+        subprocess.Popen(args, creationflags=flags, close_fds=True)
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"启动失败：{e}"
+        return out
+    out["ok"] = True
+    return out
+
+
 def verify_codex_cli(model: str, base_url: str, env_key: str, key: str,
                      cli_path: str = "", timeout: float = 300.0, log=None,
                      wire_api: str = "responses") -> dict:
@@ -2749,7 +2862,7 @@ class ProbeApp:
         self.tab_codex = frame
 
         head = ttk.LabelFrame(
-            frame, text=" ④ 接入 Codex —— 前提：网关提供 /v1/responses 或 /v1/chat/completions；本机需有 codex CLI ")
+            frame, text=" ④ 接入 Codex —— 前提：网关提供 /v1/responses 或 /v1/chat/completions；CLI 与桌面版共用同一份 config.toml ")
         head.pack(fill="x", padx=6, pady=(6, 4))
         r1 = ttk.Frame(head)
         r1.pack(fill="x", padx=8, pady=(6, 2))
@@ -2808,16 +2921,25 @@ class ProbeApp:
         ttk.Label(r2, text="（优先 gpt-6 / gpt-5 / gpt-4.1 / o 系列；也可手打）",
                   style="Hint.TLabel").pack(side="left", padx=6)
 
-        act = ttk.LabelFrame(frame, text=" 接入方式（可多选） ")
+        act = ttk.LabelFrame(frame, text=" 接入方式（可多选；桌面版与 CLI 共用同一份 config.toml） ")
         act.pack(fill="x", padx=6, pady=4)
         self.codex_write_config = tk.BooleanVar(value=True)
         self.codex_write_env = tk.BooleanVar(value=True)
+        self.codex_write_sysenv = tk.BooleanVar(value=True)
         self.codex_write_launcher = tk.BooleanVar(value=False)
         self.codex_run_verify = tk.BooleanVar(value=True)
         ttk.Checkbutton(act, text="写入 ~/.codex/config.toml（只合并 provider 与 model，改前备份）",
                         variable=self.codex_write_config).pack(anchor="w", padx=8, pady=(6, 2))
-        ttk.Checkbutton(act, text="把 Key 写进 ~/.codex/.env（Codex 的 env_key 机制；明文，改前备份）",
+        ttk.Checkbutton(act, text="写入用户级环境变量（★Codex 桌面版靠它取 Key；改完需重启桌面版）",
+                        variable=self.codex_write_sysenv).pack(anchor="w", padx=8, pady=2)
+        ttk.Checkbutton(act, text="把 Key 写进 ~/.codex/.env（CLI 的 env_key 机制；明文，改前备份）",
                         variable=self.codex_write_env).pack(anchor="w", padx=8, pady=2)
+        rd = ttk.Frame(act)
+        rd.pack(fill="x", padx=8, pady=(2, 2))
+        ttk.Button(rd, text="打开 Codex 桌面版",
+                   command=self.codex_open_desktop).pack(side="left")
+        self.lbl_codex_desktop = ttk.Label(rd, text="", style="Hint.TLabel")
+        self.lbl_codex_desktop.pack(side="left", padx=8)
         r3 = ttk.Frame(act)
         r3.pack(fill="x", padx=8, pady=2)
         ttk.Checkbutton(r3, text="生成启动脚本（临时设环境变量再启动 codex）",
@@ -3332,6 +3454,30 @@ class ProbeApp:
         cli = find_codex_cli()
         self.lbl_codex_cli.configure(text=("CLI：" + cli) if cli
                                      else "没找到 codex（端到端验证会跳过）")
+        self._refresh_codex_desktop_label()
+
+    def _refresh_codex_desktop_label(self) -> None:
+        """显示 Codex 桌面版的检测结果与它要用到的环境变量状态。"""
+        try:
+            if not codex_desktop_installed():
+                self.lbl_codex_desktop.configure(
+                    text="未检测到 Codex 桌面版（只写配置的话 CLI 也能用）")
+                return
+            name = self.var_codex_envkey.get().strip() or "CODEX_API_KEY"
+            cur = read_user_env_var(name)
+            state = f"已设（{mask_key(cur)}）" if cur else "未设置 ← 桌面版会取不到 Key"
+            self.lbl_codex_desktop.configure(text=f"已检测到桌面版；用户环境变量 {name}：{state}")
+        except Exception:
+            pass
+
+    def codex_open_desktop(self):
+        r = launch_codex_desktop(find_codex_cli())
+        if r["ok"]:
+            self._codex_log_append(f"✔ 已拉起 Codex 桌面版：{r['cmd']}")
+            self._set_status("已打开 Codex 桌面版（刚改过配置或 Key 的话，重启它才会读到最新值）")
+        else:
+            self._codex_log_append(f"✘ {r['error']}")
+            self._set_status(r["error"])
 
     def codex_autofill(self):
         models = (self.site_result or {}).get("models") or []
@@ -3450,6 +3596,9 @@ class ProbeApp:
         self._codex_log_append("=== 预览：合并后的 ~/.codex/config.toml（只显示前 30 行）===")
         for line in merged.splitlines()[:30]:
             self._codex_log_append(line)
+        if self.codex_write_sysenv.get():
+            self._codex_log_append(f"另外会把用户级环境变量 {env_key} 设成你的 Key"
+                                   "（Codex 桌面版就是靠它取值的）")
         self._set_status("预览已打印到下方日志")
 
     def codex_copy_oneliner(self):
@@ -3490,12 +3639,13 @@ class ProbeApp:
         key = self._key_value_for(self.var_codex_key, "openai")
         do_config = bool(self.codex_write_config.get())
         do_env = bool(self.codex_write_env.get())
+        do_sysenv = bool(self.codex_write_sysenv.get())
         do_launcher = bool(self.codex_write_launcher.get())
         do_verify = bool(self.codex_run_verify.get())
-        if not any((do_config, do_env, do_launcher, do_verify)):
+        if not any((do_config, do_env, do_sysenv, do_launcher, do_verify)):
             self._set_status("没有勾选任何接入方式")
             return
-        if (do_env or do_launcher) and not key:
+        if (do_env or do_launcher or do_sysenv) and not key:
             if not messagebox.askyesno("没有 Key", "要写 .env / 生成启动脚本，但没有填 Key。继续？"):
                 return
         site = self.var_site.get()
@@ -3533,6 +3683,16 @@ class ProbeApp:
                     note(f"✔ 已把 Key 写进 {r['path']}（变量名 {env_key}）"
                          + (f"，备份 {r['backup']}" if r["backup"] else "")
                          if r["ok"] else f"✘ 写 .env 失败：{r['error']}", ok=r["ok"])
+                if do_sysenv:
+                    r = set_user_env_var(env_key, key)
+                    if r["ok"]:
+                        note(f"✔ 已写入用户级环境变量 {env_key}"
+                             + ("（并已广播，之后新启动的程序立刻可见）" if r["persisted"]
+                                else "（未持久化，仅影响当前进程）"))
+                        note("  → Codex 桌面版如果现在开着，请重启它才会读到新 Key"
+                             "（配置文件的改动也一样）")
+                    else:
+                        note(f"✘ 写用户级环境变量失败：{r['error']}", ok=False)
                 if do_launcher:
                     lp = outdir / f"start-codex-{slug}.bat"
                     r = write_codex_launcher(env_key, key, lp, cli)
@@ -5400,6 +5560,29 @@ def selftest() -> int:
           rec["active_key"] == "an" and rec["key"] == "sk-an", f"-> {rec['active_key']}")
     check("删不存在的返回 False", remove_site_key(rec, "nope") is False)
 
+    print("\n[13] Codex 桌面版（共用 config.toml，Key 走用户级环境变量）")
+    TEST_ENV = "API_PROBE_SELFTEST_ENV"
+    try:
+        old = read_user_env_var(TEST_ENV)
+        r = set_user_env_var(TEST_ENV, "sk-selftest-value")
+        check("能写用户级环境变量", r["ok"] and r["persisted"], f"-> {r}")
+        check("写完能读回来", read_user_env_var(TEST_ENV) == "sk-selftest-value",
+              f"-> {read_user_env_var(TEST_ENV)!r}")
+        check("当前进程也能立刻看到（便于验证）",
+              os.environ.get(TEST_ENV) == "sk-selftest-value")
+        if old:
+            set_user_env_var(TEST_ENV, old)
+    finally:
+        delete_user_env_var(TEST_ENV)
+    check("测试变量已清理干净", read_user_env_var(TEST_ENV) == "")
+    check("删不存在的变量不报错", delete_user_env_var("API_PROBE_NOT_EXIST_XYZ") is False)
+    check("codex_desktop_installed 返回布尔", isinstance(codex_desktop_installed(), bool),
+          f"-> {codex_desktop_installed()}")
+    badlaunch = launch_codex_desktop(str(Path(tempfile.gettempdir()) / "nope-codex.exe"))
+    check("拉起桌面版失败时优雅返回", badlaunch["ok"] is False and bool(badlaunch["error"]),
+          f"-> {badlaunch}")
+    check("空 env_key 不写环境变量", set_user_env_var("", "x")["ok"] is False)
+
     print(f"\n结果：{ok_count} 通过 / {fail_count} 失败")
     return 1 if fail_count else 0
 
@@ -5785,6 +5968,30 @@ def uitest() -> int:
                   "一键接入 Codex 完成" in app.txt_codex.get("1.0", "end-1c"))
             check("测试全程用隔离的 CODEX_HOME",
                   "api_probe_codexhome_" in str(CODEX_CONFIG_PATH), f"-> {CODEX_CONFIG_PATH}")
+
+            # ---- Codex 桌面版：Key 走用户级环境变量 ----
+            check("桌面版状态标签存在", app.lbl_codex_desktop is not None)
+            check("能识别桌面版是否安装（布尔）", isinstance(codex_desktop_installed(), bool))
+            tvar = "API_PROBE_UITEST_KEY"
+            delete_user_env_var(tvar)
+            old_envkey = app.var_codex_envkey.get()
+            app.var_codex_envkey.set(tvar)
+            app.codex_write_config.set(False)
+            app.codex_write_env.set(False)
+            app.codex_write_sysenv.set(True)
+            app.codex_write_launcher.set(False)
+            app.codex_run_verify.set(False)
+            app.codex_install()
+            wait_until(lambda: not app.busy, root, timeout=40)
+            check("一键接入写入了用户级环境变量",
+                  read_user_env_var(tvar) == "sk-mock", f"-> {read_user_env_var(tvar)!r}")
+            check("接入日志提示要重启桌面版",
+                  "重启" in app.txt_codex.get("1.0", "end-1c"))
+            delete_user_env_var(tvar)
+            check("测试用的环境变量已清理", read_user_env_var(tvar) == "")
+            app.var_codex_envkey.set(old_envkey)
+            app.codex_write_config.set(True)
+            app.codex_write_env.set(True)
 
             # ---- 一个站点多把 Key（一 OpenAI 一 Anthropic），两个 CLI 页各挑各的 ----
             app._add_site_record("多Key站", "https://multi.example.com")

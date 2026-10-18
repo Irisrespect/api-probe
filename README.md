@@ -1,4 +1,4 @@
-# API 中转站测活工具（api-probe） v1.7.0
+# API 中转站测活工具（api-probe） v1.8.0
 
 单文件 Windows 桌面小工具，一条线走完：**输入地址+Key → 探测模型 → 测能不能跑得动 → 接入 Claude Code / Codex**。
 沿途把「协议族、首字延迟、疑似掺水」等信息摊开给你看。
@@ -19,9 +19,9 @@
 | 6 | 批量巡检 | 一次跑一堆站点（多 Key 的站点每把各一行），并发可调，导出 CSV/JSON 做横向对比 |
 | 7 | 持久化与安全 | 站点信息明文存、每把 Key 用 Windows DPAPI 按用户加密，可一键清除 |
 | 8 | 命令行/自动化 | `--list-only` / `--model` / `--json`，退出码 0/2 可接 CI 或计划任务 |
-| 9 | 自检 | 本地 mock 服务器，核心 159 项 + 界面流程 127 项断言，不碰你的真实配置、`~/.claude` 与 `~/.codex` |
+| 9 | 自检 | 本地 mock 服务器，核心 167 项 + 界面流程 132 项断言，不碰你的真实配置、`~/.claude` 与 `~/.codex` |
 | 10 | **Claude Code 一键接入** | 检测 /v1/messages 通道 → 映射模型别名 → 写 settings.json / 生成启动脚本 → 端到端跑通 `claude -p PONG` |
-| 11 | **Codex 一键接入（OpenAI 格式）** | 检测 `/v1/responses` 与 `/v1/chat/completions` 决定 `wire_api` → 选 GPT 模型 → 合并 `~/.codex/config.toml` + 写 `.env` → 端到端跑通 `codex exec PONG` |
+| 11 | **Codex 一键接入（CLI + 桌面版）** | 检测 `/v1/responses` 与 `/v1/chat/completions` 决定 `wire_api` → 选 GPT 模型 → 合并 `~/.codex/config.toml` + 写**用户级环境变量**（桌面版靠它取 Key）→ 端到端跑通 `codex exec PONG`；接入日志会提示重启桌面版 |
 | 12 | **每把 Key 各归其位** | Claude Code 页默认挑 Anthropic 格式的 Key，Codex 页默认挑 OpenAI 格式的；也可以手动改。
 
 ---
@@ -127,7 +127,7 @@ API Key  [ OpenAI 主 Key ▾ ] [ sk-•••••••• ] [ ]显示 [＋�
 | 方式 | 操作 |
 | --- | --- |
 | 图形界面 | 双击 **`启动.bat`**（或用 `python api_probe.py`） |
-| 自检 | 双击 **`自检.bat`**（本地 mock 服务器，159 项断言，不访问外网） |
+| 自检 | 双击 **`自检.bat`**（本地 mock 服务器，167 项断言，不访问外网） |
 | 打包 exe | 双击 **`打包exe.bat`** → 产物在 `dist\ApiProbe.exe` |
 | 命令行 | `python api_probe.py --url https://xxx.com/v1 --key sk-xxx --list-only` |
 
@@ -388,10 +388,29 @@ python api_probe.py --url https://your-gateway.com --key sk-xxx --claude-check
 
 | 方式 | 做什么 |
 | --- | --- |
-| 写入 `~/.codex/config.toml` | 顶层写 `model` + `model_provider`，末尾追加 `[model_providers.api_probe]` 表；**只动这几个键**，你原有的 `[desktop]`、`[mcp_servers]`、`[projects.*]`、其它 provider 一律保留；改前备份，**现有文件不是合法 TOML 就拒绝写入** |
-| 把 Key 写进 `~/.codex/.env` | Codex 的 `env_key` 机制就从这里取值（**明文**，改前备份；不想落盘就用下一项） |
+| 写入 `~/.codex/config.toml` | 顶层写 `model` + `model_provider`，末尾追加 `[model_providers.api_probe]` 表；**只动这几个键**，你原有的 `[desktop]`、`[mcp_servers]`、`[projects.*]`、其它 provider 一律保留；改前备份，**现有文件不是合法 TOML 就拒绝写入**。CLI 与**桌面版**共用这一份文件，写一次两边都生效 |
+| **写入用户级环境变量** | ★ **Codex 桌面版就是靠它取 Key 的**：写 `HKCU\Environment` 并广播，之后新启动的程序立刻可见（等价于 `setx`，但不用开新的终端） |
+| 把 Key 写进 `~/.codex/.env` | CLI 的 `env_key` 机制会加载这里（**明文**，改前备份） |
 | 生成启动脚本 | `start-codex-<站点>.bat`：运行时临时设好环境变量再拉起 codex，**Key 不落盘到配置文件** |
 | 运行端到端验证 | 在隔离的 `CODEX_HOME` 里跑 `codex exec "Reply with exactly: PONG" --skip-git-repo-check --ephemeral -s read-only -o last.txt` |
+
+### Codex 桌面版（Electron / MSIX）
+
+桌面版和 CLI 是**同一个内核**，所以工具的接入对两者都有效，但有两个区别必须知道：
+
+| | Codex CLI | **Codex 桌面版** |
+| --- | --- | --- |
+| 配置来源 | `~/.codex/config.toml` | **同一份** `~/.codex/config.toml`（桌面版自己的 UI 设置也存在这份文件的 `[desktop]` 段里） |
+| Key 来源 | 环境变量 / `CODEX_HOME/.env` | **用户级环境变量**（`HKCU\Environment`）——GUI 程序由资源管理器启动，拿的就是这个 |
+| 生效时机 | 每次启动都重新读 | **常驻进程，改完必须重启桌面版**才会重新读配置与环境变量 |
+| 拉起方式 | — | 工具里有「打开 Codex 桌面版」按钮（走官方的 `codex app` 命令） |
+
+所以接桌面版的正确姿势是：勾选 **「写入 config.toml」+「写入用户级环境变量」** → 点一键接入 →
+**退出并重新打开 Codex 桌面版**。工具会在接入日志里提示这一点，页面顶部也会实时显示
+「已检测到桌面版；用户环境变量 XXX：已设置/未设置」。
+
+> 桌面版的 Key 一定落在用户环境变量里（明文，注册表 `HKCU\Environment`）——这是 Codex 的 `env_key`
+> 机制决定的，不是本工具的选择。不想让它落盘就只能用「生成启动脚本」那种方式给 CLI 用。
 
 **安全设计**：合并而非覆盖、改前备份、坏 TOML 拒绝写入、验证用临时 `CODEX_HOME`（不碰你正式的 `~/.codex`）、
 页面里可一键「恢复上次备份」。重复执行不会产生重复块（有标记注释包裹）。
@@ -433,8 +452,8 @@ python api_probe.py --url ... --claude-check    # 检测这个网关能不能接
 python api_probe.py --url ... --codex-check     # 检测 OpenAI 通道，判断 Codex 该用 responses 还是 chat
 python api_probe.py --url ... --no-verify       # 跳过 TLS 证书校验（自签证书站点）
 python api_probe.py --url ... --no-deep         # 关闭深度检测，少发一次请求
-python api_probe.py --selftest                  # 核心逻辑自检（159 项）
-python api_probe.py --uitest                    # 界面 + 站点管理 + 两段式 + 两个接入页（127 项）
+python api_probe.py --selftest                  # 核心逻辑自检（167 项）
+python api_probe.py --uitest                    # 界面 + 站点管理 + 两段式 + 两个接入页（132 项）
 ```
 
 退出码：`0` 成功 / `2` 失败（可直接用于脚本巡检、CI 里做连通性卡点）。
@@ -558,7 +577,7 @@ python api_probe.py --url https://your-relay.com/v1 --key sk-xxx --list-only --j
 | --- | --- |
 | `api_probe.py` | 全部功能（核心探测 + 站点管理 + Claude Code / Codex 接入 + 图形界面 + 自检），单文件 |
 | `启动.bat` | 双击启动图形界面（纯 ASCII，勿加中文） |
-| `自检.bat` | 跑 159 项核心逻辑自检（纯 ASCII）；界面/流程自检用 `python api_probe.py --uitest`（127 项） |
+| `自检.bat` | 跑 167 项核心逻辑自检（纯 ASCII）；界面/流程自检用 `python api_probe.py --uitest`（132 项） |
 | `打包exe.bat` | 用 PyInstaller 打成单文件 exe（纯 ASCII） |
 | `README.md` | 本文档 |
 | `LICENSE` | MIT 许可证 |
@@ -573,7 +592,7 @@ python api_probe.py --url https://your-relay.com/v1 --key sk-xxx --list-only --j
 | `~/.codex/.env` | Codex 的 `env_key` 取值处（勾选时才会写，明文） |
 | `~/.api_probe/claude-code-<站点>/`、`~/.api_probe/codex-<站点>/` | 生成的启动脚本与隔离配置目录 |
 
-版本 v1.7.0（一个站点可存多把 Key，各带格式标签；Claude Code 与 Codex 两页各自认领对应格式的 Key）
+版本 v1.8.0（Codex 接入支持桌面版：写用户级环境变量、一键打开桌面版、提示重启）
 
 ---
 
