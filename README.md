@@ -540,7 +540,7 @@ python api_probe.py --url https://your-relay.com/v1 --key sk-xxx --list-only --j
 | --- | --- |
 | `api_probe.py` | 全部功能（核心探测 + 站点管理 + Claude Code / Codex 接入 + 图形界面 + 自检），单文件 |
 | `启动.bat` | 双击启动图形界面（纯 ASCII，勿加中文） |
-| `自检.bat` | 跑 148 项核心逻辑自检（纯 ASCII）；界面/流程自检用 `python api_probe.py --uitest`（109 项） |
+| `自检.bat` | 跑 148 项核心逻辑自检（纯 ASCII）；界面/流程自检用 `python api_probe.py --uitest`（111 项） |
 | `打包exe.bat` | 用 PyInstaller 打成单文件 exe（纯 ASCII） |
 | `README.md` | 本文档 |
 
