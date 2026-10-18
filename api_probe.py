@@ -2292,15 +2292,22 @@ class ProbeApp:
 
     # ---------------- Claude Code 接入 ----------------
     def _open_path(self, path) -> None:
+        """在文件管理器里打开目录（跨平台；非 Windows 用 open / xdg-open）。"""
         p = Path(path)
         if not p.exists():
             self._set_status(f"路径不存在：{p}")
             return
+        target = str(p) if p.is_dir() else str(p.parent)
         try:
-            if p.is_dir():
-                os.startfile(str(p))                      # Windows
+            if sys.platform == "win32":
+                if p.is_dir():
+                    os.startfile(str(p))
+                else:
+                    subprocess.Popen(["explorer", "/select,", str(p)])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", target])
             else:
-                subprocess.Popen(["explorer", "/select,", str(p)])
+                subprocess.Popen(["xdg-open", target])
         except Exception as e:  # noqa: BLE001
             self._set_status(f"打开失败：{e}")
 
@@ -4186,13 +4193,13 @@ def uitest() -> int:
 
         ok_a = app._add_site_record("Kimi 官方", "https://api.moonshot.cn/v1",
                                     "sk-kimi-123", "kimi-k2")
-        ok_b = app._add_site_record("cn2 中转", "https://cn2.api2cn.com",
+        ok_b = app._add_site_record("cn2 中转", "https://relay.example.com",
                                     "sk-cn2-456", "claude-sonnet-5-5")
         check("能连续添加两个站点", ok_a and ok_b and len(app.sites) == 2,
               f"-> a={ok_a} b={ok_b} n={len(app.sites)}")
         check("重复名字不允许添加", app._add_site_record("Kimi 官方", "https://x.com") is False)
         check("添加后自动选中新站点", app.var_site.get() == "cn2 中转", f"-> {app.var_site.get()}")
-        check("切换站点后地址跟着变", app.var_url.get() == "https://cn2.api2cn.com",
+        check("切换站点后地址跟着变", app.var_url.get() == "https://relay.example.com",
               f"-> {app.var_url.get()}")
         check("切换站点后 Key 跟着变", app.var_key.get() == "sk-cn2-456")
         check("切换站点后默认模型跟着变", app.var_model.get() == "claude-sonnet-5-5")
@@ -4234,7 +4241,7 @@ def uitest() -> int:
               [s["name"] for s in cfg3.get("sites", [])] == ["Kimi 官方", "cn2 中转"],
               f"-> {[s['name'] for s in cfg3.get('sites', [])]}")
         check("站点的默认模型也存了", cfg3["sites"][1].get("model") == "claude-sonnet-5-5")
-        check("站点地址明文保存", cfg3["sites"][1].get("url") == "https://cn2.api2cn.com")
+        check("站点地址明文保存", cfg3["sites"][1].get("url") == "https://relay.example.com")
         check("站点 Key 不以明文出现",
               "sk-kimi-123" not in raw3 and "sk-cn2-456" not in raw3)
 
@@ -4258,11 +4265,11 @@ def uitest() -> int:
         app3.import_sites_to_batch()
         bt = app3.txt_batch.get("1.0", "end-1c")
         check("批量列表能一键导入所有站点",
-              "cn2.api2cn.com" in bt and "api.moonshot.cn" in bt, f"-> {bt!r}")
+              "relay.example.com" in bt and "api.moonshot.cn" in bt, f"-> {bt!r}")
         check("导入的批量行带上了 Key", "sk-cn2-456" in bt)
 
         check("重命名站点",
-              app3._update_site_record("cn2 中转", "cn2-新名", "https://cn2.api2cn.com",
+              app3._update_site_record("cn2 中转", "cn2-新名", "https://relay.example.com",
                                        "sk-cn2-456", "claude-sonnet-5-5") is True)
         check("重命名后下拉同步", "cn2-新名" in list(app3.cmb_site.cget("values")),
               f"-> {app3.cmb_site.cget('values')}")

@@ -30,7 +30,7 @@
 
 ```
 站点 [ cn2 中转 ▾ ] [＋ 添加站点] [编辑] [删除]                     超时(秒) [20]
-API 地址 [ https://cn2.api2cn.com                                    ]
+API 地址 [ https://relay.example.com                                 ]
 API Key  [ sk-••••••••••••                                  ] [ ] 显示
 ```
 
@@ -98,7 +98,13 @@ API Key  [ sk-••••••••••••                              
 | 打包 exe | 双击 **`打包exe.bat`** → 产物在 `dist\ApiProbe.exe` |
 | 命令行 | `python api_probe.py --url https://xxx.com/v1 --key sk-xxx --list-only` |
 
-环境要求：Python 3.9+（本机已验证 3.14.5）。Windows 自带 `pythonw` 时启动不会弹黑窗。
+环境要求：**Python 3.9+ 且自带 tkinter**（开发与验证环境是 Windows 11 + Python 3.14.5）。
+代码只依赖标准库，理论上 macOS / Linux 也能跑，但没有做过适配与测试，已知差异：
+
+- 三个 `.bat` 是 Windows 专用；其他平台直接 `python api_probe.py`
+- Key 的本机加密用 Windows DPAPI，其他平台会退化为明文存储（配置里 `key_encrypted: false`）
+- Claude Code 的启动脚本同样是 `.bat`（其他平台用「写入 settings.json」或隔离配置目录的方式）
+- 界面字体指定了微软雅黑 / Consolas，其他平台会自动回退到默认字体
 
 > **为什么 `.bat` 里全是英文提示？**
 > cmd.exe 是按系统 OEM 码页（中文 Windows 是 936）逐行解析 `.bat` 的，而文件本身是 UTF-8。
