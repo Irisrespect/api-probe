@@ -1,27 +1,28 @@
-# API 中转站测活工具（api-probe） v1.6.0
+# API 中转站测活工具（api-probe） v1.7.0
 
 单文件 Windows 桌面小工具，一条线走完：**输入地址+Key → 探测模型 → 测能不能跑得动 → 接入 Claude Code / Codex**。
 沿途把「协议族、首字延迟、疑似掺水」等信息摊开给你看。
 
 - 纯 Python 标准库实现（tkinter + urllib），**零第三方依赖**，不需要 `pip install`
 - 一个 `.py` 文件，可直接双击运行，也可打包成单个 exe 发给别人
-- 多个站点各自记住地址 / Key / 默认模型，Key 加密存在本机
+- 多个站点各自记住地址 / 默认模型 / **多把 Key**（每把带格式标签），Key 加密存在本机
 
 **能做什么（总览）**
 
 | # | 能力 | 一句话 |
 | --- | --- | --- |
-| 1 | 多站点管理 | 添加/编辑/删除/切换任意多个中转站，各自记住地址、Key、默认模型，可一键导入批量列表 |
+| 1 | 多站点 + 多 Key | 任意多个中转站；**每个站点可存多把 Key**（各带名称与 OpenAI/Anthropic 格式标签），可一键导入批量列表 |
 | 2 | 站点体检（第①步） | 站点指纹（是不是 New API/one-api 系）、协议自动识别（OpenAI/Anthropic/Gemini）、拉回真实模型列表 |
 | 3 | 模型列表 | 过滤、只看主流、自动标记类型、复制、导出 CSV、双击即测 |
 | 4 | 真实生成测试（第②步） | 流式最小对话，测首字延迟、比对返回模型、校验 usage，参数不兼容自动重试 |
 | 5 | 掺水/降级鉴别 | 返回模型≠请求模型、首字异常快、usage 缺失、模型不在列表、面板报错特征等线索 |
-| 6 | 批量巡检 | 一次跑一堆站点，并发可调，导出 CSV/JSON 做横向对比 |
-| 7 | 持久化与安全 | 站点信息明文存、Key 用 Windows DPAPI 按用户加密，可一键清除 |
+| 6 | 批量巡检 | 一次跑一堆站点（多 Key 的站点每把各一行），并发可调，导出 CSV/JSON 做横向对比 |
+| 7 | 持久化与安全 | 站点信息明文存、每把 Key 用 Windows DPAPI 按用户加密，可一键清除 |
 | 8 | 命令行/自动化 | `--list-only` / `--model` / `--json`，退出码 0/2 可接 CI 或计划任务 |
-| 9 | 自检 | 本地 mock 服务器，核心 148 项 + 界面流程 111 项断言，不碰你的真实配置、`~/.claude` 与 `~/.codex` |
-| 10 | **Claude Code 一键接入** | 检测 /v1/messages 通道 → 映射模型别名 → 写 settings.json / 生成启动脚本 → 端到端跑通 `claude -p PONG`；**没跑通就不让点接入** |
-| 11 | **Codex 一键接入（OpenAI 格式）** | 检测 `/v1/responses` 与 `/v1/chat/completions` 决定 `wire_api` → 选 GPT 模型 → 合并 `~/.codex/config.toml` + 写 `.env` → 端到端跑通 `codex exec PONG`；同样有门禁 |
+| 9 | 自检 | 本地 mock 服务器，核心 159 项 + 界面流程 127 项断言，不碰你的真实配置、`~/.claude` 与 `~/.codex` |
+| 10 | **Claude Code 一键接入** | 检测 /v1/messages 通道 → 映射模型别名 → 写 settings.json / 生成启动脚本 → 端到端跑通 `claude -p PONG` |
+| 11 | **Codex 一键接入（OpenAI 格式）** | 检测 `/v1/responses` 与 `/v1/chat/completions` 决定 `wire_api` → 选 GPT 模型 → 合并 `~/.codex/config.toml` + 写 `.env` → 端到端跑通 `codex exec PONG` |
+| 12 | **每把 Key 各归其位** | Claude Code 页默认挑 Anthropic 格式的 Key，Codex 页默认挑 OpenAI 格式的；也可以手动改。
 
 ---
 
@@ -32,7 +33,7 @@
 ```
 站点 [ 中转站A ▾ ] [＋ 添加站点] [编辑] [删除]                     超时(秒) [20]
 API 地址 [ https://relay.example.com                                 ]
-API Key  [ sk-••••••••••••                                  ] [ ] 显示
+API Key  [ OpenAI 主 Key ▾ ] [ sk-•••••••• ] [ ]显示 [＋存为 Key] [－删除]  指定模型 [ ... ]
 ```
 
 - **＋ 添加站点**：弹窗填 `站点名称 / API 地址 / API Key / 默认模型`，里面有「常用预设」下拉可一键填入
@@ -41,9 +42,26 @@ API Key  [ sk-••••••••••••                              
 - **切换站点**：自动带出该站的 地址 + Key + 默认模型，同时把上一个站点的改动存回去。
 - **✎ 自定义（临时）**：内置的第一项，不属于站点列表，但它也**单独记住**你敲进去的地址/Key/模型——
   所以「切到 Kimi 官方 → 再切回自定义」，你原来那个自建站地址会原样回来（v1.3 修的就是这个）。
-- **批量巡检**：在「批量测试」页点 **导入站点列表**，一键把所有站点（含 Key）填成批量行。
+- **批量巡检**：在「批量测试」页点 **导入站点列表**，一键把所有站点填成批量行；
+  一个站点有多把 Key 时，**每把 Key 各占一行**，并在上一行加注释标明是哪个站点的哪把。
 
 切换站点后会清空上一次的模型列表与测试结果（列表属于上一个站点，留着会误导），重新点第 ① 步即可。
+
+### 一个站点多把 Key
+
+同一个中转站常常给你不止一把 Key，格式还可能不一样（一把走 OpenAI 兼容接口、一把走 Anthropic 接口）。
+所以站点记录里存的是**一个 Key 列表**，每把带「名称 + 格式标签」：
+
+| 操作 | 说明 |
+| --- | --- |
+| 切换 Key | 主界面「Key 下拉」选一下即可，输入框与后续所有测试都用它 |
+| **＋存为 Key** | 把输入框里当前的 Key 存成一把具名 Key，弹窗填名称 + 选格式（自动识别 / OpenAI 格式 / Anthropic 格式） |
+| **－删除** | 删掉当前选中的那把；如果删的正好是正在用的，会自动切到剩下的第一把 |
+| 格式标签的作用 | **只决定「哪个 CLI 页默认用哪把」**：Claude Code 页默认挑 `Anthropic 格式`（没有就挑「自动识别」），Codex 页默认挑 `OpenAI 格式`；两个页面里都有「使用哪个 Key」下拉可手动改，标签不限制实际调用 |
+| 老配置 | v3 及更早的单 Key 结构会自动迁移成一把名为「默认」的 Key，不丢东西 |
+
+`▶ 全流程` 会**分别用两页选中的 Key** 去测两条通道（Anthropic 用一把、OpenAI 用另一把），
+所以"一个站两把 Key、一把接 Claude 一把接 Codex"这种玩法可以一次跑完。
 
 ---
 
@@ -109,7 +127,7 @@ API Key  [ sk-••••••••••••                              
 | 方式 | 操作 |
 | --- | --- |
 | 图形界面 | 双击 **`启动.bat`**（或用 `python api_probe.py`） |
-| 自检 | 双击 **`自检.bat`**（本地 mock 服务器，148 项断言，不访问外网） |
+| 自检 | 双击 **`自检.bat`**（本地 mock 服务器，159 项断言，不访问外网） |
 | 打包 exe | 双击 **`打包exe.bat`** → 产物在 `dist\ApiProbe.exe` |
 | 命令行 | `python api_probe.py --url https://xxx.com/v1 --key sk-xxx --list-only` |
 
@@ -415,8 +433,8 @@ python api_probe.py --url ... --claude-check    # 检测这个网关能不能接
 python api_probe.py --url ... --codex-check     # 检测 OpenAI 通道，判断 Codex 该用 responses 还是 chat
 python api_probe.py --url ... --no-verify       # 跳过 TLS 证书校验（自签证书站点）
 python api_probe.py --url ... --no-deep         # 关闭深度检测，少发一次请求
-python api_probe.py --selftest                  # 核心逻辑自检（148 项）
-python api_probe.py --uitest                    # 界面 + 站点管理 + 两段式 + 两个接入页（111 项）
+python api_probe.py --selftest                  # 核心逻辑自检（159 项）
+python api_probe.py --uitest                    # 界面 + 站点管理 + 两段式 + 两个接入页（127 项）
 ```
 
 退出码：`0` 成功 / `2` 失败（可直接用于脚本巡检、CI 里做连通性卡点）。
@@ -425,14 +443,14 @@ python api_probe.py --uitest                    # 界面 + 站点管理 + 两段
 
 ## 8. 配置持久化（存了什么、存在哪、怎么加密）
 
-配置文件固定为 **`~/.api_probe.json`**（Windows 上是 `C:\Users\<你>\.api_probe.json`），界面右上角也会显示实际路径。
+配置文件固定为 **`~/.api_probe.json`**（Windows 上是 `C:\Users\<你>\.api_probe.json`，当前 schema 版本 4），界面右上角也会显示实际路径。
 
 | 内容 | 是否保存 | 形式 |
 | --- | --- | --- |
-| 站点列表：名称、地址、默认模型 | 总是保存 | 明文（不是敏感信息） |
+| 站点列表：名称、地址、默认模型、各把 Key 的名称与格式标签、当前选中哪把 | 总是保存 | 明文（不是敏感信息） |
 | 「自定义（临时）」那一格的地址与模型 | 总是保存 | 明文 |
 | 上次选中的站点、超时、并发数、TLS 校验、深度检测、只看主流、窗口大小 | 总是保存 | 明文 |
-| **各站点的 API Key** | 仅勾选「记住 Key」时 | **加密**（Windows DPAPI，按当前用户） |
+| **各站点的每一把 API Key**（含名称与格式标签） | 仅勾选「记住 Key」时 | **加密**（Windows DPAPI，按当前用户），Key 名称与格式明文 |
 | **批量测试列表**（含里面各站的 Key） | 仅勾选「记住 Key」时 | **加密**（同上） |
 
 几个要点：
@@ -444,7 +462,7 @@ python api_probe.py --uitest                    # 界面 + 站点管理 + 两段
   站点名称/地址照常生效，Key 会读不出来（此时程序不会报错，只是 Key 框为空，重填一次并重勾即可）。
 - **随时可清除**：点「清除已存 Key」按钮会一次清掉所有站点与当前输入框里的 Key；取消勾选「记住 Key」也会同时清空文件里的凭据。
 - **保存时机**：改动后约 1.2 秒自动落盘（避免每敲一键就写文件），切换/增删站点、点第 ① 步、开始批量测试、正常关闭时再各存一次。
-- **自动迁移**：v1/v2 的老配置打开后会自动升级到 v3，原来那个地址会变成一个名为「默认站点」的站点，不会丢。
+- **自动迁移**：v1/v2 的老配置会自动升级到 v3（地址变成「默认站点」）；v3 升级到 v4 时，单个 Key 会变成一把名为「默认」的 Key。都不会丢数据。
 - 顺带一提：`--selftest` / `--uitest` 全程把配置指向临时目录，**不会碰你真实的配置文件**。
 
 ---
@@ -540,7 +558,7 @@ python api_probe.py --url https://your-relay.com/v1 --key sk-xxx --list-only --j
 | --- | --- |
 | `api_probe.py` | 全部功能（核心探测 + 站点管理 + Claude Code / Codex 接入 + 图形界面 + 自检），单文件 |
 | `启动.bat` | 双击启动图形界面（纯 ASCII，勿加中文） |
-| `自检.bat` | 跑 148 项核心逻辑自检（纯 ASCII）；界面/流程自检用 `python api_probe.py --uitest`（111 项） |
+| `自检.bat` | 跑 159 项核心逻辑自检（纯 ASCII）；界面/流程自检用 `python api_probe.py --uitest`（127 项） |
 | `打包exe.bat` | 用 PyInstaller 打成单文件 exe（纯 ASCII） |
 | `README.md` | 本文档 |
 
@@ -554,4 +572,4 @@ python api_probe.py --url https://your-relay.com/v1 --key sk-xxx --list-only --j
 | `~/.codex/.env` | Codex 的 `env_key` 取值处（勾选时才会写，明文） |
 | `~/.api_probe/claude-code-<站点>/`、`~/.api_probe/codex-<站点>/` | 生成的启动脚本与隔离配置目录 |
 
-版本 v1.6.0（新增 Codex / OpenAI 格式接入：独立页面、双通道检测 wire_api、config.toml 合并、端到端验证）
+版本 v1.7.0（一个站点可存多把 Key，各带格式标签；Claude Code 与 Codex 两页各自认领对应格式的 Key）

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-API 中转站测活工具 (API Probe)  v1.6.0
+API 中转站测活工具 (API Probe)  v1.7.0
 =====================================================================
 单文件、零第三方依赖的 Windows 桌面小工具（Python 3.9+，自带 tkinter 即可运行）
 
@@ -18,7 +18,17 @@ API 中转站测活工具 (API Probe)  v1.6.0
 
     ③④ 是两个独立页面：一页管 Anthropic 格式，一页管 OpenAI 格式，互不干扰。
     顶部有「▶ 全流程（探测 → 测速 → 接入）」一键跑完；
-    两个「一键接入」各有硬门禁：② 生成测试通过 且 对应通道探测通过 才可点。
+    两个「一键接入」各有硬门禁：对应通道探测通过才可点（探测本身就是一次真实生成）。
+
+多站点 + 多 Key
+---------------
+    顶部「站点」下拉里可以放任意多个中转站，每个站点各自记住 地址 / 默认模型，以及
+    **多把 Key**：
+        同一个站可能给你 OpenAI 一把、Anthropic 一把（甚至更多），每把带名称与格式标签
+        主界面用「Key 下拉」切换当前用哪把，「＋存为 Key」把输入框里的 Key 存成具名的一把
+        Claude Code 页默认挑 Anthropic 格式的那把，Codex 页默认挑 OpenAI 格式的那把
+        两边都可以在下拉里手动改成别的（格式标签只影响默认挑选，不限制实际调用）
+    加完站点还能一键导入批量列表做巡检（多 Key 的站点每把 Key 各占一行）。
 
 多站点管理
 ----------
@@ -93,7 +103,7 @@ import zlib
 from pathlib import Path
 
 APP_NAME = "API 中转站测活工具"
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) api-probe/1.0"
 DEFAULT_TIMEOUT = 20.0
 CONFIG_PATH = Path.home() / ".api_probe.json"
@@ -1458,6 +1468,7 @@ def suggest_claude_model_map(models: list[dict], fallback: str = "") -> dict:
 
 def run_full_pipeline(base_input: str, key: str, model: str = "",
                       timeout: float = DEFAULT_TIMEOUT, verify: bool = True, deep: bool = True,
+                      cc_key: str = "", codex_key: str = "",
                       log=None, stop_event: threading.Event | None = None) -> dict:
     """一条龙走完用户的四步流程：
 
@@ -1516,11 +1527,11 @@ def run_full_pipeline(base_input: str, key: str, model: str = "",
         return out
 
     L("[3/4] 检测 CLI 通道：Anthropic(/v1/messages) 与 OpenAI(/v1/responses、/v1/chat/completions)")
-    ch = check_anthropic_channel(base, key, used, timeout=timeout, verify=verify, log=log,
-                                 stop_event=stop_event)
+    ch = check_anthropic_channel(base, cc_key or key, used, timeout=timeout, verify=verify,
+                                 log=log, stop_event=stop_event)
     out["channel"] = ch
-    och = check_openai_channel(base, key, used, timeout=timeout, verify=verify, log=log,
-                               stop_event=stop_event)
+    och = check_openai_channel(base, codex_key or key, used, timeout=timeout, verify=verify,
+                               log=log, stop_event=stop_event)
     out["channel_openai"] = och
     a_txt = (f"Anthropic 认证 {ch['auth_style']}" if ch.get("ok") else
              ("Anthropic 认证通过(模型不可用)" if ch.get("model_not_found") else "Anthropic 不可用"))
@@ -2226,6 +2237,81 @@ def write_codex_launcher(env_key: str, key: str, path: str | Path,
 # 「站点」下拉里那个不落盘的临时项
 ADHOC_SITE = "✎ 自定义（临时）"
 
+# 一个中转站可以存多把 Key（有的站 OpenAI 一把、Anthropic 一把），每把带格式标签
+KEY_FORMATS = ("auto", "openai", "anthropic")
+KEY_FORMAT_LABEL = {"auto": "自动识别", "openai": "OpenAI 格式", "anthropic": "Anthropic 格式"}
+
+
+def site_keys(rec) -> list[dict]:
+    """取站点记录里的 Key 列表。兼容只有单个 key 的旧结构。"""
+    if not isinstance(rec, dict):
+        return []
+    ks = rec.get("keys")
+    if isinstance(ks, list):
+        out = [k for k in ks if isinstance(k, dict) and str(k.get("name") or "").strip()]
+        if out:
+            return out
+    single = str(rec.get("key") or "").strip()
+    return [{"name": "默认", "format": "auto", "key": single}] if single else []
+
+
+def find_site_key(rec, name: str):
+    for k in site_keys(rec):
+        if k.get("name") == name:
+            return k
+    return None
+
+
+def pick_site_key(rec, prefer_format: str = ""):
+    """挑一把 Key：先找格式完全匹配的，其次「自动识别」，再退回站点当前选中的，最后第一把。"""
+    ks = site_keys(rec)
+    if not ks:
+        return None
+    if prefer_format:
+        for k in ks:
+            if k.get("format") == prefer_format:
+                return k
+        for k in ks:
+            if k.get("format") == "auto":
+                return k
+    act = str((rec or {}).get("active_key") or "")
+    for k in ks:
+        if k.get("name") == act:
+            return k
+    return ks[0]
+
+
+def upsert_site_key(rec: dict, name: str, value: str, fmt: str = "auto") -> dict:
+    """新增或更新一把 Key（同名视为更新）。返回那把 Key。"""
+    name = (name or "").strip()
+    ks = rec.setdefault("keys", [])
+    if not isinstance(ks, list):
+        ks = rec["keys"] = []
+    k = find_site_key(rec, name)
+    if k is None:
+        k = {"name": name, "format": fmt, "key": value}
+        ks.append(k)
+    else:
+        k["format"] = fmt or k.get("format") or "auto"
+        k["key"] = value
+    rec["active_key"] = name
+    rec["key"] = value
+    return k
+
+
+def remove_site_key(rec: dict, name: str) -> bool:
+    ks = rec.get("keys")
+    if not isinstance(ks, list):
+        return False
+    for i, k in enumerate(ks):
+        if isinstance(k, dict) and k.get("name") == name:
+            ks.pop(i)
+            if rec.get("active_key") == name:
+                rec["active_key"] = ks[0]["name"] if ks else ""
+                rec["key"] = ks[0].get("key", "") if ks else ""
+            return True
+    return False
+
 # 添加/编辑站点对话框里的「常用预设」快速填充
 QUICK_PRESETS = [
     ("自定义 / 中转站", ""),
@@ -2354,14 +2440,23 @@ class ProbeApp:
         row2 = ttk.Frame(top)
         row2.pack(fill="x", padx=8, pady=(0, 4))
         ttk.Label(row2, text="API Key").pack(side="left")
+        self.var_keyname = tk.StringVar()
+        self.cmb_key = ttk.Combobox(row2, textvariable=self.var_keyname, width=15,
+                                    state="readonly", values=[])
+        self.cmb_key.pack(side="left", padx=(6, 4))
+        self.cmb_key.bind("<<ComboboxSelected>>", self._on_key_change)
         self.var_key = tk.StringVar()
         self.ent_key = ttk.Entry(row2, textvariable=self.var_key, show="*", font=self.mono_font)
-        self.ent_key.pack(side="left", fill="x", expand=True, padx=(6, 8))
+        self.ent_key.pack(side="left", fill="x", expand=True, padx=(0, 8))
         self.ent_key.bind("<Return>", lambda e: self.fetch_models())
         self.ent_key.bind("<KeyRelease>", self._on_conn_changed)
         self.var_show = tk.BooleanVar(value=False)
         ttk.Checkbutton(row2, text="显示", variable=self.var_show,
                         command=self._toggle_key).pack(side="left")
+        ttk.Button(row2, text="＋存为 Key", command=self.add_site_key).pack(side="left", padx=(8, 0))
+        self.btn_key_del = ttk.Button(row2, text="－删除", command=self.delete_site_key,
+                                      state="disabled")
+        self.btn_key_del.pack(side="left", padx=(4, 0))
 
         ttk.Label(row2, text="指定模型").pack(side="left", padx=(14, 0))
         self.var_model = tk.StringVar()
@@ -2582,6 +2677,13 @@ class ProbeApp:
             self.cc_model_vars[key] = (var, cmb)
         grid.columnconfigure(1, weight=1)
         grid.columnconfigure(4, weight=1)
+        ttk.Label(grid, text="使用哪个 Key").grid(row=2, column=0, sticky="w", padx=(0, 4), pady=3)
+        self.var_cc_key = tk.StringVar()
+        self.cmb_cc_key = ttk.Combobox(grid, textvariable=self.var_cc_key, width=32,
+                                       state="readonly")
+        self.cmb_cc_key.grid(row=2, column=1, sticky="we", padx=(0, 16), pady=3)
+        ttk.Label(grid, text="（同一站点可存多把 Key，这里默认挑 Anthropic 格式的那把）",
+                  style="Hint.TLabel").grid(row=2, column=2, columnspan=2, sticky="w")
         r2 = ttk.Frame(mapf)
         r2.pack(fill="x", padx=8, pady=(0, 6))
         ttk.Button(r2, text="从当前站点模型列表自动匹配",
@@ -2688,6 +2790,13 @@ class ProbeApp:
         c.grid(row=1, column=3, sticky="w", pady=3)
         grid.columnconfigure(1, weight=1)
         grid.columnconfigure(3, weight=1)
+        ttk.Label(grid, text="使用哪个 Key").grid(row=2, column=0, sticky="w", padx=(0, 4), pady=3)
+        self.var_codex_key = tk.StringVar()
+        self.cmb_codex_key = ttk.Combobox(grid, textvariable=self.var_codex_key, width=32,
+                                          state="readonly")
+        self.cmb_codex_key.grid(row=2, column=1, sticky="we", padx=(0, 16), pady=3)
+        ttk.Label(grid, text="（默认挑 OpenAI 格式的那把）",
+                  style="Hint.TLabel").grid(row=2, column=2, columnspan=2, sticky="w")
         r2 = ttk.Frame(mapf)
         r2.pack(fill="x", padx=8, pady=(0, 6))
         ttk.Button(r2, text="从当前站点模型列表挑一个",
@@ -2787,8 +2896,11 @@ class ProbeApp:
 
         def work():
             try:
-                res = run_full_pipeline(base, key, model, timeout=timeout, verify=verify,
-                                        deep=deep, log=self._log, stop_event=self.stop_event)
+                res = run_full_pipeline(
+                    base, key, model, timeout=timeout, verify=verify, deep=deep,
+                    cc_key=self._key_value_for(self.var_cc_key, "anthropic"),
+                    codex_key=self._key_value_for(self.var_codex_key, "openai"),
+                    log=self._log, stop_event=self.stop_event)
                 self.q.put(("flow_done", res))
             except Exception as e:  # noqa: BLE001
                 self.q.put(("fatal", f"{type(e).__name__}: {e}"))
@@ -2981,7 +3093,7 @@ class ProbeApp:
         if not base:
             self._set_status("请先填写 API 地址")
             return
-        key = self.var_key.get().strip()
+        key = self._key_value_for(self.var_cc_key, "anthropic")
         model = self.cc_model_vars["default"][0].get().strip() or self.var_model.get().strip()
         self.stop_event.clear()
         self.busy = True
@@ -3029,7 +3141,8 @@ class ProbeApp:
         mm = {k: v[0].get().strip() for k, v in self.cc_model_vars.items()}
         default = mm.pop("default", "")
         style = (self.cc_state or {}).get("auth_style") or "bearer"
-        env = build_claude_env(self.var_url.get().strip(), self.var_key.get().strip(),
+        env = build_claude_env(self.var_url.get().strip(),
+                               self._key_value_for(self.var_cc_key, "anthropic"),
                                style, mm, default)
         return env, style
 
@@ -3055,7 +3168,8 @@ class ProbeApp:
 
     def cc_copy_oneliner(self):
         env, _ = self.cc_build_env()
-        if not env.get("ANTHROPIC_BASE_URL") or not self.var_key.get().strip():
+        if not env.get("ANTHROPIC_BASE_URL") or not self._key_value_for(self.var_cc_key,
+                                                                      "anthropic"):
             self._set_status("需要地址与 Key 才能生成临时命令")
             return
         payload = json.dumps({"env": env}, ensure_ascii=False, separators=(",", ":"))
@@ -3261,7 +3375,7 @@ class ProbeApp:
         if not base:
             self._set_status("请先填写 API 地址")
             return
-        key = self.var_key.get().strip()
+        key = self._key_value_for(self.var_codex_key, "openai")
         model = self.var_codex_model.get().strip() or self.var_model.get().strip()
         self.stop_event.clear()
         self.busy = True
@@ -3336,7 +3450,7 @@ class ProbeApp:
 
     def codex_copy_oneliner(self):
         model, base_url, env_key, wire = self.codex_params()
-        if not base_url or not model or not self.var_key.get().strip():
+        if not base_url or not model or not self._key_value_for(self.var_codex_key, "openai"):
             self._set_status("需要地址、模型与 Key 才能生成临时命令")
             return
         cmd = (f'codex exec -c model="{model}" '
@@ -3369,7 +3483,7 @@ class ProbeApp:
         if not model or not base_url:
             self._set_status("缺少模型或地址")
             return
-        key = self.var_key.get().strip()
+        key = self._key_value_for(self.var_codex_key, "openai")
         do_config = bool(self.codex_write_config.get())
         do_env = bool(self.codex_write_env.get())
         do_launcher = bool(self.codex_write_launcher.get())
@@ -3493,18 +3607,166 @@ class ProbeApp:
 
         必须是 _active_site（上一次真正装载的），不能用下拉框的当前值 —— 否则
         切换站点的瞬间会把旧站点的内容覆盖到新站点上。
+        Key 除了写 rec["key"]，还会同步进 keys[] 里当前选中的那一把。
         """
         rec = self._record_for(self._active_site)
         if rec is None:
             return
+        cur_key = self.var_key.get().strip()
         rec["url"] = self.var_url.get().strip()
-        rec["key"] = self.var_key.get().strip()
         rec["model"] = self.var_model.get().strip()
+        rec["key"] = cur_key
+        k = find_site_key(rec, str(rec.get("active_key") or ""))
+        if k is not None:
+            k["key"] = cur_key
 
     def _apply_record(self, rec: dict) -> None:
         self.var_url.set(rec.get("url", "") or "")
         self.var_key.set(rec.get("key", "") or "")
         self.var_model.set(rec.get("model", "") or "")
+        self._refresh_key_combo()
+
+    def _refresh_key_combo(self) -> None:
+        """按当前装载的那一格刷新 Key 下拉。"""
+        rec = self._record_for(self._active_site) or {}
+        names = [k["name"] for k in site_keys(rec)]
+        act = str(rec.get("active_key") or "")
+        if act not in names:
+            act = names[0] if names else ""
+        try:
+            self.cmb_key.configure(values=names or ["（尚未保存 Key）"])
+            self.var_keyname.set(act or (names[0] if names else ""))
+            self.btn_key_del.configure(state="normal" if act else "disabled")
+        except Exception:
+            pass
+        self._refresh_cli_key_combos()
+
+    def _refresh_cli_key_combos(self) -> None:
+        """两个 CLI 接入页各自按格式偏好挑一把 Key。"""
+        rec = self._record_for(self._active_site) or {}
+        names = [k["name"] for k in site_keys(rec)]
+        for cmb_name, var_name, fmt in (("cmb_cc_key", "var_cc_key", "anthropic"),
+                                        ("cmb_codex_key", "var_codex_key", "openai")):
+            cmb = getattr(self, cmb_name, None)
+            var = getattr(self, var_name, None)
+            if cmb is None or var is None:
+                continue
+            try:
+                cmb.configure(values=names or ["（用主界面的 Key）"])
+                k = pick_site_key(rec, fmt)
+                var.set(k["name"] if k else (names[0] if names else "（用主界面的 Key）"))
+            except Exception:
+                pass
+
+    def _on_key_change(self, _evt=None) -> None:
+        """切换这个站点里的哪把 Key。"""
+        rec = self._record_for(self._active_site)
+        if rec is None:
+            return
+        self._stash_current_fields()          # 先把输入框内容存回旧的那把
+        name = self.var_keyname.get()
+        k = find_site_key(rec, name)
+        if k is None:
+            return
+        rec["active_key"] = name
+        rec["key"] = k.get("key", "")
+        self.var_key.set(k.get("key", ""))
+        self._invalidate_results()
+        self._save_config()
+        fmt = KEY_FORMAT_LABEL.get(str(k.get("format") or "auto"), "")
+        self._set_status(f"已切到 Key「{name}」（{fmt}）")
+
+    def _key_value_for(self, var, prefer_format: str) -> str:
+        """取某把 Key 的值：先按名字找，再按格式偏好找，最后退回主界面输入框。"""
+        rec = self._record_for(self._active_site) or {}
+        k = find_site_key(rec, str(var.get() if var is not None else ""))
+        if k is None:
+            k = pick_site_key(rec, prefer_format)
+        return str((k or {}).get("key") or "").strip() or self.var_key.get().strip()
+
+    def _key_dialog(self, title: str, init_name: str = "", init_format: str = "auto"):
+        """保存/编辑一把具名 Key 的小对话框，返回 dict 或 None。"""
+        tk, ttk = self.tk, self.ttk
+        dlg = tk.Toplevel(self.root)
+        dlg.title(title)
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        out = {"value": None}
+        body = ttk.Frame(dlg)
+        body.pack(fill="both", expand=True, padx=14, pady=12)
+        v_name = tk.StringVar(value=init_name)
+        v_fmt = tk.StringVar(value=KEY_FORMAT_LABEL.get(init_format, KEY_FORMAT_LABEL["auto"]))
+        ttk.Label(body, text="名称").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Entry(body, textvariable=v_name, width=28, font=self.mono_font).grid(
+            row=0, column=1, sticky="we", padx=(8, 0), pady=4)
+        ttk.Label(body, text="格式").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Combobox(body, textvariable=v_fmt, state="readonly", width=26,
+                     values=[KEY_FORMAT_LABEL[f] for f in KEY_FORMATS]).grid(
+            row=1, column=1, sticky="w", padx=(8, 0), pady=4)
+        ttk.Label(body, text="格式只用于「这个 CLI 页默认用哪把 Key」，不会限制实际调用。",
+                  style="Hint.TLabel", wraplength=380).grid(row=2, column=1, sticky="w")
+        err = ttk.Label(body, text="", foreground=COLORS["risk"])
+        err.grid(row=3, column=1, sticky="w")
+
+        def ok(_e=None):
+            name = v_name.get().strip()
+            if not name:
+                err.configure(text="请填写名称")
+                return
+            fmt = next((f for f in KEY_FORMATS
+                        if KEY_FORMAT_LABEL[f] == v_fmt.get()), "auto")
+            out["value"] = {"name": name, "format": fmt}
+            dlg.destroy()
+
+        bar = ttk.Frame(body)
+        bar.grid(row=4, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(bar, text="确定", command=ok).pack(side="left", padx=4)
+        ttk.Button(bar, text="取消", command=dlg.destroy).pack(side="left")
+        dlg.bind("<Return>", ok)
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        self.root.wait_window(dlg)
+        return out["value"]
+
+    def add_site_key(self):
+        """把输入框里当前的 Key 存成这个站点的一把具名 Key。"""
+        from tkinter import messagebox
+        rec = self._record_for(self._active_site)
+        val = self.var_key.get().strip()
+        if not val:
+            self._set_status("请先在 API Key 框里填入要保存的 Key")
+            return
+        if rec is None:
+            return
+        names = [k["name"] for k in site_keys(rec)]
+        data = self._key_dialog("保存为具名 Key", f"Key{len(names) + 1}" if names else "默认")
+        if not data:
+            return
+        existed = find_site_key(rec, data["name"]) is not None
+        if existed and not messagebox.askyesno("覆盖 Key",
+                                               f"已存在名为「{data['name']}」的 Key，覆盖它？"):
+            return
+        upsert_site_key(rec, data["name"], val, data["format"])
+        self._refresh_key_combo()
+        self._save_config()
+        self._set_status(f"已{'更新' if existed else '保存'} Key「{data['name']}」"
+                         f"（{KEY_FORMAT_LABEL.get(data['format'], '')}）")
+
+    def delete_site_key(self):
+        from tkinter import messagebox
+        rec = self._record_for(self._active_site)
+        name = self.var_keyname.get()
+        if rec is None or not name or find_site_key(rec, name) is None:
+            self._set_status("没有选中的具名 Key")
+            return
+        if not messagebox.askyesno("删除 Key", f"删除这个站点的 Key「{name}」？"):
+            return
+        remove_site_key(rec, name)
+        self.var_key.set(str(rec.get("key") or ""))
+        self._refresh_key_combo()
+        self._invalidate_results()
+        self._save_config()
+        self._set_status(f"已删除 Key「{name}」")
 
     def _refresh_site_combo(self) -> None:
         self.cmb_site.configure(values=[ADHOC_SITE] + [s["name"] for s in self.sites])
@@ -3719,15 +3981,21 @@ class ProbeApp:
             self._set_status(f"已删除站点「{name}」")
 
     def import_sites_to_batch(self):
-        """把所有已保存的站点导入批量测试框，一键巡检多个中转站。"""
+        """把所有已保存的站点导入批量测试框；一个站点有多把 Key 时，每把各占一行。"""
         self._stash_current_fields()
         lines = []
         for s in self.sites:
-            parts = [s.get("url", ""), s.get("key", ""), s.get("model", "")]
-            while parts and not parts[-1]:
-                parts.pop()
-            if parts and parts[0]:
-                lines.append(" | ".join(parts))
+            ks = site_keys(s)
+            if not ks:
+                continue
+            for k in ks:
+                parts = [s.get("url", ""), k.get("key", ""), s.get("model", "")]
+                while parts and not parts[-1]:
+                    parts.pop()
+                if parts and parts[0]:
+                    if len(ks) > 1 and k.get("name"):
+                        lines.append(f"# {s.get('name', '')} / {k['name']}")
+                    lines.append(" | ".join(parts))
         if self.var_url.get().strip() and self._active_site == ADHOC_SITE:
             parts = [self.var_url.get().strip(), self.var_key.get().strip(),
                      self.var_model.get().strip()]
@@ -3792,9 +4060,10 @@ class ProbeApp:
         self._set_status(f"已复制 {len(ids)} 个模型名")
 
     # ---------------- 配置持久化 ----------------
-    # 保存位置：~/.api_probe.json（config_version 3）
-    #   明文：各站点 名称/地址/默认模型、超时、各开关、窗口大小
-    #   加密：各站点的 Key 与批量列表 —— 只有勾选「记住 Key」才写盘，用 Windows DPAPI 加密
+    # 保存位置：~/.api_probe.json（config_version 4）
+    #   明文：各站点 名称/地址/默认模型、各把 Key 的名称与格式、超时、各开关、窗口大小
+    #   加密：各站点每一把 Key 的值、以及批量列表 —— 只有勾选「记住 Key」才写盘，用 DPAPI 加密
+    #   v3 → v4：单 Key 结构迁移成 key 列表（原名「默认」）
     def _load_config(self):
         try:
             if not CONFIG_PATH.exists():
@@ -3826,26 +4095,66 @@ class ProbeApp:
             name = str(s.get("name") or "").strip()
             if not name or name == ADHOC_SITE:
                 continue
-            key = ""
-            if remember and s.get("key"):
-                key = decode_secret(str(s["key"]), bool(s.get("key_encrypted", False)))
+            keys: list[dict] = []
+            for k in s.get("keys") or []:
+                if not isinstance(k, dict):
+                    continue
+                kname = str(k.get("name") or "").strip()
+                if not kname:
+                    continue
+                kval = ""
+                if remember and k.get("key"):
+                    kval = decode_secret(str(k["key"]), bool(k.get("key_encrypted", False)))
+                keys.append({"name": kname, "format": str(k.get("format") or "auto"),
+                             "key": kval})
+            if not keys and s.get("key"):        # v3 及更早：单 Key 结构
+                keys = [{"name": "默认", "format": "auto",
+                         "key": decode_secret(str(s["key"]),
+                                              bool(s.get("key_encrypted", False)))
+                         if remember else ""}]
+            act = str(s.get("active_key") or "")
+            if act not in [k["name"] for k in keys]:
+                act = keys[0]["name"] if keys else ""
             self.sites.append({"name": name, "url": str(s.get("url") or ""),
-                               "model": str(s.get("model") or ""), "key": key})
+                               "model": str(s.get("model") or ""),
+                               "keys": keys, "active_key": act,
+                               "key": (find_site_key({"keys": keys}, act) or {}).get("key", "")})
         # 「自定义（临时）」那一格
         ad = cfg.get("adhoc") if isinstance(cfg.get("adhoc"), dict) else {}
+        ad_keys: list[dict] = []
+        for k in ad.get("keys") or []:
+            if not isinstance(k, dict):
+                continue
+            kname = str(k.get("name") or "").strip()
+            if not kname:
+                continue
+            kval = ""
+            if remember and k.get("key"):
+                kval = decode_secret(str(k["key"]), bool(k.get("key_encrypted", False)))
+            ad_keys.append({"name": kname, "format": str(k.get("format") or "auto"), "key": kval})
         adhoc_key = ""
         if remember:
             blob = str(ad.get("key") or "") or str(cfg.get("key") or "")
             enc = bool(ad.get("key_encrypted", cfg.get("key_encrypted", False)))
             adhoc_key = decode_secret(blob, enc)
+        if not ad_keys and adhoc_key:
+            ad_keys = [{"name": "默认", "format": "auto", "key": adhoc_key}]
+        ad_act = str(ad.get("active_key") or "")
+        if ad_act not in [k["name"] for k in ad_keys]:
+            ad_act = ad_keys[0]["name"] if ad_keys else ""
         self.adhoc = {"name": ADHOC_SITE,
                       "url": str(ad.get("url") or cfg.get("url") or ""),
                       "model": str(ad.get("model") or cfg.get("model") or ""),
-                      "key": adhoc_key}
+                      "keys": ad_keys, "active_key": ad_act,
+                      "key": (find_site_key({"keys": ad_keys}, ad_act) or {}).get("key", "")
+                             or adhoc_key}
         # v1/v2 -> v3 迁移：老配置只有一个 url，把它变成一个站点，免得用户以为丢了
         if not self.sites and int(cfg.get("config_version") or 1) < 3 and self.adhoc["url"]:
             self.sites.append({"name": "默认站点", "url": self.adhoc["url"],
-                               "model": self.adhoc["model"], "key": self.adhoc["key"]})
+                               "model": self.adhoc["model"],
+                               "keys": list(self.adhoc.get("keys") or []),
+                               "active_key": self.adhoc.get("active_key", ""),
+                               "key": self.adhoc.get("key", "")})
         # 当前选中的站点
         names = [ADHOC_SITE] + [s["name"] for s in self.sites]
         cur = str(cfg.get("current_site") or "")
@@ -3871,10 +4180,25 @@ class ProbeApp:
             for s in self.sites:
                 rec = {"name": s.get("name", ""), "url": s.get("url", ""),
                        "model": s.get("model", "")}
-                if remember and s.get("key"):
-                    rec["key"], rec["key_encrypted"] = encode_secret(s["key"])
+                keys_out = []
+                for k in site_keys(s):
+                    ko = {"name": k.get("name", ""), "format": k.get("format") or "auto"}
+                    if remember and k.get("key"):
+                        ko["key"], ko["key_encrypted"] = encode_secret(k["key"])
+                    keys_out.append(ko)
+                rec["keys"] = keys_out
+                rec["active_key"] = s.get("active_key") or (keys_out[0]["name"] if keys_out else "")
                 sites_out.append(rec)
             adhoc_out = {"url": self.adhoc.get("url", ""), "model": self.adhoc.get("model", "")}
+            ad_keys_out = []
+            for k in site_keys(self.adhoc):
+                ko = {"name": k.get("name", ""), "format": k.get("format") or "auto"}
+                if remember and k.get("key"):
+                    ko["key"], ko["key_encrypted"] = encode_secret(k["key"])
+                ad_keys_out.append(ko)
+            adhoc_out["keys"] = ad_keys_out
+            adhoc_out["active_key"] = (self.adhoc.get("active_key")
+                                       or (ad_keys_out[0]["name"] if ad_keys_out else ""))
             if remember and self.adhoc.get("key"):
                 adhoc_out["key"], adhoc_out["key_encrypted"] = encode_secret(self.adhoc["key"])
             batch_blob, batch_enc = ("", True)
@@ -3882,7 +4206,7 @@ class ProbeApp:
                 batch_blob, batch_enc = encode_secret(
                     self.txt_batch.get("1.0", "end-1c").strip())
             cfg = {
-                "config_version": 3,
+                "config_version": 4,
                 "current_site": self.var_site.get(),
                 "sites": sites_out,
                 "adhoc": adhoc_out,
@@ -5047,6 +5371,31 @@ def selftest() -> int:
         check("找不到 codex 时优雅失败",
               missing["ok"] is False and "没找到" in missing["error"], f"-> {missing['error']}")
 
+    print("\n[12] 一个站点多把 Key（可能是不同格式）")
+    old_rec = {"key": "sk-single"}
+    ks0 = site_keys(old_rec)
+    check("老的单 Key 结构读成「默认」", len(ks0) == 1 and ks0[0]["name"] == "默认",
+          f"-> {ks0}")
+    rec = {"keys": [{"name": "oa", "format": "openai", "key": "sk-oa"},
+                    {"name": "an", "format": "anthropic", "key": "sk-an"}],
+           "active_key": "an", "key": "sk-an"}
+    check("多 Key 全部读出", [k["name"] for k in site_keys(rec)] == ["oa", "an"])
+    check("按名字找 Key", (find_site_key(rec, "oa") or {}).get("key") == "sk-oa")
+    check("按格式挑：anthropic → an", pick_site_key(rec, "anthropic")["name"] == "an")
+    check("按格式挑：openai → oa", pick_site_key(rec, "openai")["name"] == "oa")
+    check("格式都不匹配时退回当前选中的", pick_site_key(rec, "gemini")["name"] == "an")
+    upsert_site_key(rec, "third", "sk-3", "auto")
+    check("新增 Key 并自动设为当前",
+          len(site_keys(rec)) == 3 and rec["active_key"] == "third" and rec["key"] == "sk-3")
+    upsert_site_key(rec, "third", "sk-3b", "openai")
+    check("同名视为更新而非新增",
+          len(site_keys(rec)) == 3 and find_site_key(rec, "third")["key"] == "sk-3b")
+    check("删除 Key", remove_site_key(rec, "oa") is True and len(site_keys(rec)) == 2)
+    remove_site_key(rec, "third")
+    check("删掉当前 Key 后自动切到剩下那把",
+          rec["active_key"] == "an" and rec["key"] == "sk-an", f"-> {rec['active_key']}")
+    check("删不存在的返回 False", remove_site_key(rec, "nope") is False)
+
     print(f"\n结果：{ok_count} 通过 / {fail_count} 失败")
     return 1 if fail_count else 0
 
@@ -5432,6 +5781,67 @@ def uitest() -> int:
                   "一键接入 Codex 完成" in app.txt_codex.get("1.0", "end-1c"))
             check("测试全程用隔离的 CODEX_HOME",
                   "api_probe_codexhome_" in str(CODEX_CONFIG_PATH), f"-> {CODEX_CONFIG_PATH}")
+
+            # ---- 一个站点多把 Key（一 OpenAI 一 Anthropic），两个 CLI 页各挑各的 ----
+            app._add_site_record("多Key站", "https://multi.example.com")
+            check("新站点已选中", app.var_site.get() == "多Key站")
+            rec_mk = app._record_for("多Key站")
+            upsert_site_key(rec_mk, "OpenAI Key", "sk-oa-123", "openai")
+            upsert_site_key(rec_mk, "Anthropic Key", "sk-an-456", "anthropic")
+            rec_mk["active_key"] = "OpenAI Key"
+            rec_mk["key"] = "sk-oa-123"
+            app.var_key.set("sk-oa-123")
+            app._refresh_key_combo()
+            check("Key 下拉列出两把",
+                  list(app.cmb_key.cget("values")) == ["OpenAI Key", "Anthropic Key"],
+                  f"-> {list(app.cmb_key.cget('values'))}")
+            check("Claude 页默认挑 Anthropic 那把",
+                  app.var_cc_key.get() == "Anthropic Key", f"-> {app.var_cc_key.get()}")
+            check("Codex 页默认挑 OpenAI 那把",
+                  app.var_codex_key.get() == "OpenAI Key", f"-> {app.var_codex_key.get()}")
+            check("两页各取到正确的 Key 值",
+                  app._key_value_for(app.var_cc_key, "anthropic") == "sk-an-456"
+                  and app._key_value_for(app.var_codex_key, "openai") == "sk-oa-123")
+
+            app.var_keyname.set("Anthropic Key")
+            app._on_key_change()
+            check("切换 Key 后输入框跟着换", app.var_key.get() == "sk-an-456")
+            check("切换后 active_key 更新", rec_mk.get("active_key") == "Anthropic Key")
+
+            app.var_remember.set(True)
+            app._save_config()
+            cfg_mk = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            site_mk = next(s for s in cfg_mk["sites"] if s["name"] == "多Key站")
+            check("配置里存了两把 Key",
+                  [k["name"] for k in site_mk.get("keys", [])] == ["OpenAI Key", "Anthropic Key"],
+                  f"-> {site_mk.get('keys')}")
+            check("每把 Key 都带格式标签",
+                  [k.get("format") for k in site_mk["keys"]] == ["openai", "anthropic"])
+            check("记住了当前选中的是哪把", site_mk.get("active_key") == "Anthropic Key")
+            raw_mk = CONFIG_PATH.read_text(encoding="utf-8")
+            check("两把 Key 都不以明文出现",
+                  "sk-oa-123" not in raw_mk and "sk-an-456" not in raw_mk)
+            check("配置版本升到 v4", cfg_mk.get("config_version") == 4,
+                  f"-> {cfg_mk.get('config_version')}")
+
+            root4 = tk.Tk()
+            root4.withdraw()
+            app4 = ProbeApp(root4)
+            site4 = next((s for s in app4.sites if s["name"] == "多Key站"), None)
+            check("重启后两把 Key 都在",
+                  site4 is not None and [k["name"] for k in site_keys(site4)] ==
+                  ["OpenAI Key", "Anthropic Key"], f"-> {site4 and site_keys(site4)}")
+            check("重启后 Key 值能解密回来",
+                  (find_site_key(site4, "OpenAI Key") or {}).get("key") == "sk-oa-123"
+                  and (find_site_key(site4, "Anthropic Key") or {}).get("key") == "sk-an-456")
+            app4._select_site("多Key站")
+            check("重启后自动选中上次那把 Key",
+                  app4.var_keyname.get() == "Anthropic Key" and app4.var_key.get() == "sk-an-456",
+                  f"-> {app4.var_keyname.get()}")
+            check("重启后 CLI 页仍各自认领格式",
+                  app4.var_cc_key.get() == "Anthropic Key"
+                  and app4.var_codex_key.get() == "OpenAI Key")
+            root4.destroy()
         finally:
             srv_cc.shutdown()
     except Exception as e:  # noqa: BLE001
