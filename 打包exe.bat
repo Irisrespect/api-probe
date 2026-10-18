@@ -18,6 +18,17 @@ if errorlevel 1 goto fail
 echo.
 echo Done. Output: %~dp0dist\ApiProbe.exe
 echo Copy that exe anywhere - the target machine does not need Python.
+
+rem ---------------------------------------------------------------------
+rem Workaround for sandboxed workspaces: if this folder (or any parent) has a
+rem "Low" mandatory integrity label (e.g. a sandboxed session directory), the
+rem built exe inherits that label. Windows then starts the exe at low integrity,
+rem and a low-integrity process cannot create directories under %TEMP%, which
+rem makes PyInstaller onefile fail with "Could not create temporary directory!".
+rem Re-labelling the artifact as Medium is a no-op on a normal machine.
+rem ---------------------------------------------------------------------
+icacls "%~dp0dist\ApiProbe.exe" /setintegritylevel Medium >nul 2>nul
+
 pause
 exit /b 0
 

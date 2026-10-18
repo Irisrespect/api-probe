@@ -401,6 +401,19 @@ python api_probe.py --uitest                    # 界面 + 站点管理 + 两段
 **Q：报 SSL 证书错误？**
 自建站常用自签证书，取消勾选「校验 TLS 证书」即可（**仅对你信任的地址这么做**）。
 
+**Q：双击 exe 报 `Could not create temporary directory!`？**
+PyInstaller 单文件包运行时要把内容解包到 `%TEMP%`，而 **Low 完整性进程无权在 Medium 的 `%TEMP%` 下建目录**。
+最常见的原因是 **exe 所在目录被打了「低完整性级别（Low integrity）」标签**——Windows 会让该目录下的
+可执行文件也以 Low 完整性启动。沙箱类工具、部分加固过的目录会造成这种情况。
+
+处置：把 exe 移到普通目录（如下载文件夹）再运行；或原地改标签：
+
+```powershell
+icacls "路径\ApiProbe.exe" /setintegritylevel Medium
+```
+
+`打包exe.bat` 结尾已自动执行这一步，重新打包不会再踩到。
+
 **Q：这个工具能帮我规避风险吗？**
 不能。它只能告诉你"这个 Key 现在能不能用、返回的东西像不像真的"。跑路、突然涨价、
 数据留存这类风险，工具测不出来——遵循老规矩：小额充值试水、多站互为备份、

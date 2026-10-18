@@ -21,3 +21,10 @@ dist/
 *.swp
 Thumbs.db
 desktop.ini
+
+# 临时构建 / 测试产物
+_tiny*
+_tmp*
+*.pkg
+*.pyz
+*.toc
