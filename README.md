@@ -1,6 +1,6 @@
-# API 中转站测活工具（api-probe） v1.5.0
+# API 中转站测活工具（api-probe） v1.6.0
 
-单文件 Windows 桌面小工具，一条线走完：**输入地址+Key → 探测模型 → 测能不能跑得动 → 接入 Claude Code CLI**。
+单文件 Windows 桌面小工具，一条线走完：**输入地址+Key → 探测模型 → 测能不能跑得动 → 接入 Claude Code / Codex**。
 沿途把「协议族、首字延迟、疑似掺水」等信息摊开给你看。
 
 - 纯 Python 标准库实现（tkinter + urllib），**零第三方依赖**，不需要 `pip install`
@@ -19,8 +19,9 @@
 | 6 | 批量巡检 | 一次跑一堆站点，并发可调，导出 CSV/JSON 做横向对比 |
 | 7 | 持久化与安全 | 站点信息明文存、Key 用 Windows DPAPI 按用户加密，可一键清除 |
 | 8 | 命令行/自动化 | `--list-only` / `--model` / `--json`，退出码 0/2 可接 CI 或计划任务 |
-| 9 | 自检 | 本地 mock 服务器，核心 109 项 + 界面流程 91 项断言，不碰你的真实配置与 `~/.claude` |
+| 9 | 自检 | 本地 mock 服务器，核心 148 项 + 界面流程 109 项断言，不碰你的真实配置、`~/.claude` 与 `~/.codex` |
 | 10 | **Claude Code 一键接入** | 检测 /v1/messages 通道 → 映射模型别名 → 写 settings.json / 生成启动脚本 → 端到端跑通 `claude -p PONG`；**没跑通就不让点接入** |
+| 11 | **Codex 一键接入（OpenAI 格式）** | 检测 `/v1/responses` 与 `/v1/chat/completions` 决定 `wire_api` → 选 GPT 模型 → 合并 `~/.codex/config.toml` + 写 `.env` → 端到端跑通 `codex exec PONG`；同样有门禁 |
 
 ---
 
@@ -56,23 +57,31 @@ API Key  [ sk-••••••••••••                              
 ② 对选中模型发测试   真发一次最小对话：能不能出字、首字多快 → 给出「流畅度」判断
         ↓
 ③ 接入 Claude Code   检测 /v1/messages → 映射模型别名 → 写配置 → 端到端验证
+        ↓
+④ 接入 Codex         检测 /v1/responses 与 /v1/chat/completions → 写 config.toml → 端到端验证
 ```
 
-顶部按钮栏就是这个顺序：`① 获取模型列表`、`② 对选中模型发测试`、`③ 接入 Claude Code`，
-另外有一个 **`▶ 全流程（探测 → 测速 → 接入）`** 把三步一次跑完：它做完 ① 探测、② 生成测试、
-③ 通道检测与模型映射，然后停在「接入」前等你确认——**真正的写入永远由你点一下**。
+③ 和 ④ 是**两个独立页面**：一页管 Anthropic 格式（Claude Code），一页管 OpenAI 格式（Codex），
+两边的通道探测、模型选择、接入方式、门禁与日志互不干扰；站点列表与 Key 两边共用。
+
+顶部按钮栏就是这个顺序：`① 获取模型列表`、`② 对选中模型发测试`、`③ 接入 Claude Code`、`④ 接入 Codex`，
+另外有一个 **`▶ 全流程（探测 → 测速 → 接入）`** 把整条线一次跑完：它做完 ① 探测、② 生成测试、
+③ 两条通道的检测（Anthropic + OpenAI）与模型映射，然后停在「接入」前等你确认——
+**真正的写入永远由你点一下**。
 
 ### 接入按钮有门禁
 
-「▶ 一键接入」默认是**灰色不可点**的，只有同时满足两个条件才解锁：
+每个页面的「一键接入」默认都是**灰色不可点**的，各自要同时满足两个条件才解锁：
 
-1. ② 生成测试通过（这个 Key + 这个模型真的能出字）
-2. ③ `/v1/messages` 通道探测通过（这个网关真的支持 Anthropic 协议）
+| 页面 | 条件 1 | 条件 2 |
+| --- | --- | --- |
+| Claude Code | ② 生成测试通过 | Anthropic `/v1/messages` 通道探测通过 |
+| Codex | ② 生成测试通过 | OpenAI 通道探测通过（`/v1/responses` 或 `/v1/chat/completions`） |
 
-没解锁时，按钮旁边会直接写明**缺哪一步**（例如「未解锁：第 ② 步生成测试还没通过…」）。
-换站点、改地址或改 Key 会立刻把门禁重新锁上——避免拿 A 站的结果去写 B 站的配置。
+没解锁时按钮旁边会写明**缺哪一步**（例如「未解锁：第 ② 步生成测试还没通过…」）。
+换站点、改地址或改 Key 会立刻把两边的门禁一起锁上——避免拿 A 站的结果去写 B 站的配置。
 
-`▶ 全流程` 跑完且两项都通过时，会弹一句「现在就把这套配置写进 Claude Code 吗？」，
+`▶ 全流程` 跑完且对应通道通过时，会弹一句「现在就把这套配置写进 Claude Code / Codex 吗？」，
 点「是」才写入，且写入前自动备份。
 
 ### 流畅度
@@ -243,7 +252,7 @@ API Key  [ sk-••••••••••••                              
 
 ---
 
-## 6. Claude Code 一键接入
+## 6. Claude Code 一键接入（Anthropic 格式，独立一页）
 
 Claude Code CLI 2.x 支持直连第三方网关，但有两个坑：**网关必须实现 Anthropic Messages 协议**、
 **模型名必须做映射**。这一页把「检测 → 配置 → 验证」串成一步。
@@ -331,6 +340,58 @@ python api_probe.py --url https://your-gateway.com --key sk-xxx --claude-check
 
 ---
 
+## 6b. Codex 一键接入（OpenAI 格式）
+
+**独立一页**（顶部 `④ 接入 Codex`）。Codex 与 Claude Code 的配置思路完全不同，要点就三条：
+
+| 要点 | 说明 |
+| --- | --- |
+| **base_url 要带 `/v1`** | 与 `ANTHROPIC_BASE_URL` 正好相反。写 `https://gw.example.com/v1`，Codex 自己拼 `/responses` 或 `/chat/completions` |
+| **`wire_api` 二选一** | `responses`（打 `/v1/responses`）或 `chat`（打 `/v1/chat/completions`）。工具会**两条都试**，把能用的那条写进配置 |
+| **Key 不进配置文件** | 配置里只写 `env_key = "变量名"`，真正的 Key 放在该环境变量里。Codex 会加载 `~/.codex/.env`，所以工具默认把 Key 写在那儿 |
+
+### ① 检测通道
+
+依次对 `POST {base}/v1/responses` 与 `POST {base}/v1/chat/completions` 发最小请求（`Reply with exactly: PONG`），
+判读与 Claude 页一致：200 通过 / 401 鉴权失败 / **404 但提到模型**说明路径通、模型不对 / 404 路径级说明没这个协议。
+
+### ② 选模型
+
+点「从当前站点模型列表挑一个」会优先选 `gpt-6` → `gpt-5` → `gpt-4.1` → `o4`/`o3` → `gpt-4o` → `codex` 系列，
+也可直接手打（比如你网关上的私有命名）。
+
+### ③ 一键接入（可多选）
+
+| 方式 | 做什么 |
+| --- | --- |
+| 写入 `~/.codex/config.toml` | 顶层写 `model` + `model_provider`，末尾追加 `[model_providers.api_probe]` 表；**只动这几个键**，你原有的 `[desktop]`、`[mcp_servers]`、`[projects.*]`、其它 provider 一律保留；改前备份，**现有文件不是合法 TOML 就拒绝写入** |
+| 把 Key 写进 `~/.codex/.env` | Codex 的 `env_key` 机制就从这里取值（**明文**，改前备份；不想落盘就用下一项） |
+| 生成启动脚本 | `start-codex-<站点>.bat`：运行时临时设好环境变量再拉起 codex，**Key 不落盘到配置文件** |
+| 运行端到端验证 | 在隔离的 `CODEX_HOME` 里跑 `codex exec "Reply with exactly: PONG" --skip-git-repo-check --ephemeral -s read-only -o last.txt` |
+
+**安全设计**：合并而非覆盖、改前备份、坏 TOML 拒绝写入、验证用临时 `CODEX_HOME`（不碰你正式的 `~/.codex`）、
+页面里可一键「恢复上次备份」。重复执行不会产生重复块（有标记注释包裹）。
+
+### 命令行
+
+```bash
+python api_probe.py --url https://your-gateway.com --key sk-xxx --model gpt-5.1 --codex-check
+```
+
+打印两条通道的检测结论与建议写入的 `[model_providers.*]` 片段（Key 不写进配置）；退出码 `0` = 通道可用。
+
+### Codex 排错速查
+
+| 症状 | 原因 | 处置 |
+| --- | --- | --- |
+| 报 404 且路径级 | `base_url` 少了或多了 `/v1` | Codex 要带 `/v1`（与 Anthropic 相反），工具会自动补 |
+| 明明设了 Key 却 401 | `env_key` 写的变量名与实际设置的不一致；或新终端没生效 | 核对变量名；`echo %CODEX_API_KEY%` 看有没有值；工具默认写 `~/.codex/.env` |
+| 报模型不可用 | 该 Key 的可用模型里没这个 id | 在 Codex 页点「从当前站点模型列表挑一个」重选 |
+| 改完配置没生效 | 有更高优先级的 config（`-p profile` 分层）或环境变量覆盖 | `codex exec` 支持 `-c key=value` 覆盖；本工具也提供「复制临时命令」 |
+| 找不到 codex 命令 | 没装 CLI，或桌面版自带的 codex.exe 不在 PATH | 工具会自动去 `%LOCALAPPDATA%\OpenAI\Codex\bin\*\codex.exe` 找（桌面版自带） |
+
+---
+
 ## 7. 命令行用法
 
 ```bash
@@ -345,10 +406,11 @@ python api_probe.py --url https://xxx.com/v1 --key sk-xxx --json > out.json
 
 python api_probe.py --list-only --json          # 第 ① 步的机器可读输出
 python api_probe.py --url ... --claude-check    # 检测这个网关能不能接 Claude Code CLI
+python api_probe.py --url ... --codex-check     # 检测 OpenAI 通道，判断 Codex 该用 responses 还是 chat
 python api_probe.py --url ... --no-verify       # 跳过 TLS 证书校验（自签证书站点）
 python api_probe.py --url ... --no-deep         # 关闭深度检测，少发一次请求
-python api_probe.py --selftest                  # 核心逻辑自检（97 项）
-python api_probe.py --uitest                    # 界面 + 站点管理 + 两段式 + 接入页自检
+python api_probe.py --selftest                  # 核心逻辑自检（148 项）
+python api_probe.py --uitest                    # 界面 + 站点管理 + 两段式 + 两个接入页（109 项）
 ```
 
 退出码：`0` 成功 / `2` 失败（可直接用于脚本巡检、CI 里做连通性卡点）。
@@ -460,8 +522,9 @@ python api_probe.py --url https://your-relay.com/v1 --key sk-xxx --list-only --j
 | ❌ 查余额 / 额度 | 各家中转站余额接口五花八门，目前只看"能不能通" |
 | ❌ 并发压测 | 单次最小请求，反映连通性与模型真实性，不代表吞吐能力 |
 | ❌ 非 Windows 平台的加密存储 | DPAPI 是 Windows 专有；其他平台会退回明文存储（配置里 `key_encrypted: false`） |
-| ❌ 让 Claude Code 接上只支持 OpenAI 协议的站 | 那种站必须先有协议转换层（cc-switch / claude-code-router 之类），本工具只能明确告诉你"接不上" |
-| ❌ 替你安装 Claude Code CLI | 只做检测与配置；CLI 请用官方安装器或 `npm i -g @anthropic-ai/claude-code` |
+| ❌ 让 Claude Code 接上只支持 OpenAI 协议的站 | 那种站必须先有协议转换层（cc-switch / claude-code-router 之类），本工具只能明确告诉你"接不上"；反过来这个站通常可以直接接 Codex |
+| ❌ 替你安装 CLI | 只做检测与配置；Claude Code 用官方安装器或 `npm i -g @anthropic-ai/claude-code`，Codex 用官方 CLI 或桌面版自带的 `codex.exe` |
+| ❌ 让 Codex 用上非 GPT 命名的模型 | 只要网关的 `/v1/responses` 或 `/v1/chat/completions` 认这个 id 就能用，工具不限制名字；但 Codex 自身的 agent 行为按 OpenAI 模型调优，换别的模型效果不保证 |
 
 ---
 
@@ -469,9 +532,9 @@ python api_probe.py --url https://your-relay.com/v1 --key sk-xxx --list-only --j
 
 | 文件 | 说明 |
 | --- | --- |
-| `api_probe.py` | 全部功能（核心探测 + 站点管理 + Claude Code 接入 + 图形界面 + 自检），单文件 |
+| `api_probe.py` | 全部功能（核心探测 + 站点管理 + Claude Code / Codex 接入 + 图形界面 + 自检），单文件 |
 | `启动.bat` | 双击启动图形界面（纯 ASCII，勿加中文） |
-| `自检.bat` | 跑 109 项核心逻辑自检（纯 ASCII）；界面/流程自检用 `python api_probe.py --uitest`（91 项） |
+| `自检.bat` | 跑 148 项核心逻辑自检（纯 ASCII）；界面/流程自检用 `python api_probe.py --uitest`（109 项） |
 | `打包exe.bat` | 用 PyInstaller 打成单文件 exe（纯 ASCII） |
 | `README.md` | 本文档 |
 
@@ -481,6 +544,8 @@ python api_probe.py --url https://your-relay.com/v1 --key sk-xxx --list-only --j
 | --- | --- |
 | `~/.api_probe.json` | 站点列表与设置（Key 加密） |
 | `~/.claude/settings.json` | Claude Code 配置（本工具只合并 `ANTHROPIC_*` 键，改前自动备份） |
-| `~/.api_probe/claude-code-<站点>/` | 生成的启动脚本与隔离配置目录 |
+| `~/.codex/config.toml` | Codex 配置（本工具只改 `model`/`model_provider` 与 `[model_providers.api_probe]`，改前自动备份） |
+| `~/.codex/.env` | Codex 的 `env_key` 取值处（勾选时才会写，明文） |
+| `~/.api_probe/claude-code-<站点>/`、`~/.api_probe/codex-<站点>/` | 生成的启动脚本与隔离配置目录 |
 
-版本 v1.5.0（线性工作流 + `▶ 全流程` 一键跑完 探测→测速→接入；接入按钮加硬门禁：没跑通不给点）
+版本 v1.6.0（新增 Codex / OpenAI 格式接入：独立页面、双通道检测 wire_api、config.toml 合并、端到端验证）

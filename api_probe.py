@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-API 中转站测活工具 (API Probe)  v1.5.0
+API 中转站测活工具 (API Probe)  v1.6.0
 =====================================================================
 单文件、零第三方依赖的 Windows 桌面小工具（Python 3.9+，自带 tkinter 即可运行）
 
@@ -14,9 +14,11 @@ API 中转站测活工具 (API Probe)  v1.5.0
     ② 对选中模型发测试  真发一次最小对话：能不能出字、首字多快（流畅度）
         ↓
     ③ 接入 Claude Code  检测 /v1/messages → 映射模型别名 → 写配置 → 端到端验证
+    ④ 接入 Codex        检测 /v1/responses 与 /v1/chat/completions → 写 config.toml → 端到端验证
 
-    顶部有「▶ 全流程（探测 → 测速 → 接入）」一键跑完前三步；
-    「一键接入」有硬门禁：② 生成测试通过 且 ③ 通道探测通过 才可点（按钮旁会写明缺哪一步）。
+    ③④ 是两个独立页面：一页管 Anthropic 格式，一页管 OpenAI 格式，互不干扰。
+    顶部有「▶ 全流程（探测 → 测速 → 接入）」一键跑完；
+    两个「一键接入」各有硬门禁：② 生成测试通过 且 对应通道探测通过 才可点。
 
 多站点管理
 ----------
@@ -91,7 +93,7 @@ import zlib
 from pathlib import Path
 
 APP_NAME = "API 中转站测活工具"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) api-probe/1.0"
 DEFAULT_TIMEOUT = 20.0
 CONFIG_PATH = Path.home() / ".api_probe.json"
@@ -1461,8 +1463,9 @@ def run_full_pipeline(base_input: str, key: str, model: str = "",
 
         ① 探测模型列表
         ② 生成测试（能不能真的跑、跑得流不流畅）
-        ③ 检测 Anthropic 通道 /v1/messages（Claude Code 的前提）
-        ④ 给出模型映射建议（sonnet/opus/haiku/fable → 网关真实 id）
+        ③ 检测两条 CLI 通道：Anthropic /v1/messages（Claude Code）与
+           OpenAI /v1/responses、/v1/chat/completions（Codex）
+        ④ 给出模型映射建议（claude 别名 + Codex 默认模型）
 
     返回 {"site","gen","channel","model_map","steps","fluency","ok","verdict",...}。
     不做任何写入动作 —— 写配置由 GUI 的「一键接入」显式触发。
@@ -1471,9 +1474,9 @@ def run_full_pipeline(base_input: str, key: str, model: str = "",
         if log:
             log(msg)
 
-    out = {"site": {}, "gen": {}, "channel": {}, "model_map": {}, "used_model": "",
-           "fluency_level": "", "fluency": "", "ok": False, "stopped": False,
-           "steps": [], "verdict": ""}
+    out = {"site": {}, "gen": {}, "channel": {}, "channel_openai": {}, "model_map": {},
+           "codex_model": "", "used_model": "", "fluency_level": "", "fluency": "",
+           "ok": False, "stopped": False, "steps": [], "verdict": ""}
 
     def step(no, text, ok=None, detail=""):
         out["steps"].append({"no": no, "text": text, "ok": ok, "detail": detail})
@@ -1512,29 +1515,35 @@ def run_full_pipeline(base_input: str, key: str, model: str = "",
         out.update(stopped=True, verdict="已手动停止")
         return out
 
-    L("[3/4] 检测 /v1/messages 通道")
+    L("[3/4] 检测 CLI 通道：Anthropic(/v1/messages) 与 OpenAI(/v1/responses、/v1/chat/completions)")
     ch = check_anthropic_channel(base, key, used, timeout=timeout, verify=verify, log=log,
                                  stop_event=stop_event)
     out["channel"] = ch
-    step(3, "检测 /v1/messages 通道", bool(ch.get("ok")),
-         (f"认证方式 {ch['auth_style']}" if ch.get("auth_style") else "")
-         or ch.get("verdict", ""))
+    och = check_openai_channel(base, key, used, timeout=timeout, verify=verify, log=log,
+                               stop_event=stop_event)
+    out["channel_openai"] = och
+    a_txt = (f"Anthropic 认证 {ch['auth_style']}" if ch.get("ok") else
+             ("Anthropic 认证通过(模型不可用)" if ch.get("model_not_found") else "Anthropic 不可用"))
+    o_txt = (f"OpenAI wire_api={och['wire_api']}" if och.get("ok") else "OpenAI 不可用")
+    step(3, "检测 CLI 通道（Anthropic + OpenAI）",
+         bool(ch.get("ok") or ch.get("model_not_found") or och.get("ok")),
+         f"{a_txt}；{o_txt}")
 
     mm = suggest_claude_model_map(site.get("models") or [], fallback=used)
     out["model_map"] = mm
-    step(4, "生成模型映射建议", bool(mm),
+    out["codex_model"] = suggest_codex_model(site.get("models") or [], fallback=used)
+    step(4, "生成模型映射建议", bool(mm) or bool(out["codex_model"]),
          "、".join(f"{k}→{v}" for k, v in mm.items()) or "没匹配到 claude 系模型")
 
     gen_ok = bool(out["gen"].get("ok"))
-    ch_ok = bool(ch.get("ok")) or bool(ch.get("model_not_found"))
-    out["ok"] = gen_ok and ch_ok
+    a_ok = bool(ch.get("ok")) or bool(ch.get("model_not_found"))
+    o_ok = bool(och.get("ok"))
+    out["ok"] = gen_ok and (a_ok or o_ok)
     bits = ["模型可用" if gen_ok else "生成测试未通过"]
-    if ch.get("ok"):
-        bits.append("Anthropic 通道可用")
-    elif ch.get("model_not_found"):
-        bits.append("Anthropic 通道认证通过（模型映射后即可用）")
-    else:
-        bits.append("Anthropic 通道不可用")
+    bits.append("Claude Code 通道可用" if ch.get("ok")
+                else ("Claude Code 通道认证通过（映射模型后可用）" if ch.get("model_not_found")
+                      else "Claude Code 通道不可用"))
+    bits.append(f"Codex 通道可用（wire_api={och['wire_api']}）" if o_ok else "Codex 通道不可用")
     out["verdict"] = ("全流程" + ("通过：" if out["ok"] else "未完全通过：") + "；".join(bits)
                       + (f"；{out['fluency']}" if out["fluency"] else ""))
     L(f"流程结论：{out['verdict']}")
@@ -1775,7 +1784,443 @@ def find_claude_backups(path: str | Path | None = None) -> list[Path]:
 
 
 # =====================================================================
-# 八、图形界面
+# 八、Codex CLI 接入（OpenAI 格式）
+# =====================================================================
+# Codex CLI 读 ~/.codex/config.toml，第三方网关靠 [model_providers.*] 描述：
+#     [model_providers.<id>]
+#     name = "..."            # 随便起，给人看
+#     base_url = "https://gw.example.com/v1"   # 注意：与 Anthropic 相反，这里要带 /v1
+#     env_key = "XXX_API_KEY" # Key 不放配置文件，而是从这个环境变量读（Codex 会加载 ~/.codex/.env）
+#     wire_api = "responses"  # 或 "chat"：决定打 /v1/responses 还是 /v1/chat/completions
+# 顶层再写 model / model_provider 指过去。
+# 所以本节的活是两个判断：网关支持哪种 wire_api、这个 Key 能用哪个模型。
+
+CODEX_HOME = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+CODEX_CONFIG_PATH = CODEX_HOME / "config.toml"
+CODEX_ENV_PATH = CODEX_HOME / ".env"
+CODEX_PROVIDER_ID = "api_probe"
+CODEX_MANAGED_BEGIN = "# >>> api-probe managed provider (auto-generated) >>>"
+CODEX_MANAGED_END = "# <<< api-probe managed provider <<<"
+CODEX_TOP_BEGIN = "# >>> api-probe managed top-level (auto-generated) >>>"
+CODEX_TOP_END = "# <<< api-probe managed top-level <<<"
+CODEX_PING_PROMPT = "Reply with exactly: PONG"
+
+
+def find_codex_cli() -> str:
+    """找 codex：先 PATH，再桌面版自带运行时（路径带版本号会变，按修改时间取最新）。"""
+    try:
+        w = shutil.which("codex")
+        if w:
+            return w
+    except Exception:
+        pass
+    hits: list[Path] = []
+    for root in (Path(os.environ.get("LOCALAPPDATA") or "") / "OpenAI" / "Codex" / "bin",
+                 Path(os.environ.get("LOCALAPPDATA") or "") / "Programs" / "codex"):
+        try:
+            if root.is_dir():
+                hits.extend(p for p in root.rglob("codex.exe") if p.is_file())
+        except Exception:
+            continue
+    for extra in (Path.home() / ".local" / "bin" / "codex.exe",
+                  Path(os.environ.get("APPDATA") or "") / "npm" / "codex.cmd"):
+        try:
+            if extra.exists():
+                hits.append(extra)
+        except Exception:
+            continue
+    if not hits:
+        return ""
+    hits.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return str(hits[0])
+
+
+def codex_base_url_for_gateway(base: str) -> str:
+    """Codex 的 base_url 要带 /v1（与 ANTHROPIC_BASE_URL 正好相反）。"""
+    root = normalize_base(base)
+    return f"{root}/v1" if root else ""
+
+
+def codex_ping_payload(model: str, wire_api: str) -> dict:
+    if wire_api == "responses":
+        return {"model": model, "input": CODEX_PING_PROMPT, "max_output_tokens": 16}
+    return {"model": model, "max_tokens": 16, "stream": False,
+            "messages": [{"role": "user", "content": CODEX_PING_PROMPT}]}
+
+
+def responses_reply_text(obj) -> str:
+    """从 Responses API 响应里取纯文本。"""
+    if not isinstance(obj, dict):
+        return ""
+    if isinstance(obj.get("output_text"), str) and obj["output_text"]:
+        return obj["output_text"].strip()
+    out = []
+    for item in obj.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        for blk in item.get("content") or []:
+            if isinstance(blk, dict) and isinstance(blk.get("text"), str):
+                out.append(blk["text"])
+            elif isinstance(blk, str):
+                out.append(blk)
+    return "".join(out).strip()
+
+
+def chat_reply_text(obj) -> str:
+    if not isinstance(obj, dict):
+        return ""
+    for ch in obj.get("choices") or []:
+        if isinstance(ch, dict):
+            msg = ch.get("message") or {}
+            if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+                return msg["content"].strip()
+    return ""
+
+
+def check_openai_channel(base: str, key: str, model: str = "",
+                         timeout: float = DEFAULT_TIMEOUT, verify: bool = True,
+                         log=None, stop_event: threading.Event | None = None) -> dict:
+    """检测 OpenAI 格式通道：/v1/responses 与 /v1/chat/completions 哪个可用。
+
+    返回里的 wire_api 就是要写进 Codex config.toml 的值（responses / chat）。
+    """
+    def L(msg):
+        if log:
+            log(msg)
+
+    res = {"ok": False, "wire_api": "", "auth_style": "bearer", "status": 0, "error": "",
+           "model_used": model or "", "reply": "", "latency_ms": None, "tried": [],
+           "base_url": codex_base_url_for_gateway(base), "verdict": "", "verdict_level": "error"}
+    gw = codex_base_url_for_gateway(base)
+    if not gw:
+        res["verdict"] = "地址为空"
+        return res
+    probe_timeout = max(5.0, min(timeout, 20.0))
+
+    for wire, path in (("responses", "/responses"), ("chat", "/chat/completions")):
+        if stop_event is not None and stop_event.is_set():
+            res["verdict"] = "已手动停止"
+            return res
+        url = gw + path
+        r = http_request("POST", url, headers=claude_auth_headers("bearer", key),
+                         payload=codex_ping_payload(res["model_used"], wire),
+                         timeout=probe_timeout, verify=verify)
+        msg = "" if r.ok else (r.error or extract_error_message(r.text, r.status))
+        info = {"wire_api": wire, "url": url, "status": r.status, "ms": r.latency_ms, "error": msg}
+        L(f"  [OpenAI/{wire}] POST {url} → {r.status or r.error} {r.latency_ms}ms")
+        res["tried"].append(info)
+        if r.ok:
+            text = (responses_reply_text(r.json) if wire == "responses"
+                    else chat_reply_text(r.json))
+            res.update(ok=True, wire_api=wire, status=r.status, latency_ms=r.latency_ms,
+                       reply=text[:240], error="")
+            info["ok"] = True
+            break
+        low = ((msg or "") + " " + (r.text or "")[:600]).lower()
+        if r.status == 404 and ("model" in low or "not supported" in low):
+            res.update(status=404, error=msg, latency_ms=r.latency_ms)
+            info["model_not_found"] = True
+            continue          # 路径是通的，只是模型不行 → 再看下一条通道
+        res.update(status=r.status, error=msg, latency_ms=r.latency_ms)
+
+    model_404 = bool(res["tried"]) and all(t.get("model_not_found") for t in res["tried"])
+    if res["ok"]:
+        res["verdict"] = (f"OpenAI 通道可用：wire_api = {res['wire_api']}，"
+                          f"非流式 {res['latency_ms']:.0f}ms，返回 {res['reply'][:40]!r}")
+        res["verdict_level"] = "ok"
+    elif model_404:
+        res["verdict"] = (f"两条通道路径都在（404 但提到模型），只是模型「{res['model_used']}」"
+                          "不可用 → 换个模型再测")
+        res["verdict_level"] = "warn"
+    else:
+        statuses = [t.get("status") for t in res["tried"]]
+        if statuses and all(s in (401, 403) for s in statuses):
+            res["verdict"] = (f"端点存在（返回 {statuses[0]} 而非 404），但鉴权失败：{res['error']}"
+                              " —— 换一个有效 Key 再测")
+            res["verdict_level"] = "warn"
+        else:
+            res["verdict"] = f"OpenAI 通道不可用：{res['error'] or '未知错误'}"
+            res["verdict_level"] = "error"
+    return res
+
+
+def suggest_codex_model(models: list[dict], fallback: str = "") -> str:
+    """从模型清单里挑一个适合 Codex 的默认模型。"""
+    ids = [str(m.get("id") or "") for m in (models or []) if m.get("id")]
+    if not ids:
+        return fallback or ""
+    if fallback and fallback in ids:
+        return fallback
+    cands = [i for i in ids
+             if not any(b in i.lower() for b in NON_CHAT_MARKERS)
+             and not any(v in i.lower() for v in VARIANT_MARKERS)]
+    for want in ("gpt-6", "gpt-5", "gpt-4.1", "o4", "o3", "gpt-4o", "codex", "gpt-4"):
+        hit = [i for i in cands if want in i.lower()]
+        if hit:
+            hit.sort(key=lambda s: (len(s), s))
+            return hit[0]
+    if fallback:
+        return fallback
+    return choose_default_model(models) if models else ""
+
+
+def render_codex_top_block(model: str) -> str:
+    """顶层键（TOML 要求裸键写在任何 [table] 之前）。"""
+    return (f"{CODEX_TOP_BEGIN}\n"
+            f'model = "{model}"\n'
+            f'model_provider = "{CODEX_PROVIDER_ID}"\n'
+            f"{CODEX_TOP_END}\n")
+
+
+def render_codex_provider_block(base_url: str, env_key: str, wire_api: str = "responses",
+                                provider_name: str = "API Probe") -> str:
+    return (f"{CODEX_MANAGED_BEGIN}\n"
+            f"[model_providers.{CODEX_PROVIDER_ID}]\n"
+            f'name = "{provider_name}"\n'
+            f'base_url = "{base_url}"\n'
+            f'env_key = "{env_key}"\n'
+            f'wire_api = "{wire_api}"\n'
+            f"{CODEX_MANAGED_END}\n")
+
+
+def _strip_marker_block(text: str, begin: str, end: str) -> str:
+    out, skipping = [], False
+    for line in text.splitlines(keepends=True):
+        if line.strip() == begin:
+            skipping = True
+            continue
+        if line.strip() == end:
+            skipping = False
+            continue
+        if not skipping:
+            out.append(line)
+    return "".join(out)
+
+
+def merge_codex_config(existing: str, model: str, base_url: str, env_key: str,
+                       provider_name: str = "API Probe", wire_api: str = "responses") -> str:
+    """把 provider 表与顶层 model/model_provider 合并进现有 config.toml。
+
+    - 先删掉上次由本工具写入的标记块，可反复执行
+    - 顶层原有的 model / model_provider 会被替换（否则 TOML 重复键直接报错），旧值在备份里
+    - 顶层块放文件开头（TOML 要求裸键在表之前），provider 表追加到末尾
+    """
+    text = _strip_marker_block(existing or "", CODEX_MANAGED_BEGIN, CODEX_MANAGED_END)
+    text = _strip_marker_block(text, CODEX_TOP_BEGIN, CODEX_TOP_END)
+    kept: list[str] = []
+    in_table = False
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("[") and not s.startswith("[["):
+            in_table = True
+        if not in_table and re.match(r"^\s*(model|model_provider)\s*=", line):
+            continue
+        kept.append(line)
+    body = "\n".join(kept).strip("\n")
+    top = render_codex_top_block(model)
+    table = render_codex_provider_block(base_url, env_key, wire_api, provider_name)
+    return f"{top}\n{body}\n\n{table}" if body else f"{top}\n{table}"
+
+
+def install_codex_config(model: str, base_url: str, env_key: str,
+                         provider_name: str = "API Probe", wire_api: str = "responses",
+                         path: str | Path | None = None) -> dict:
+    """写入 ~/.codex/config.toml（合并 + 备份；读不出来就中止，不覆盖）。"""
+    p = Path(path) if path else CODEX_CONFIG_PATH
+    out = {"ok": False, "path": str(p), "backup": "", "error": "", "old_model": "",
+           "old_provider": "", "text": ""}
+    existing = ""
+    if p.exists():
+        try:
+            existing = p.read_text(encoding="utf-8")
+        except Exception as e:  # noqa: BLE001
+            out["error"] = f"读取失败，已中止：{e}"
+            return out
+        # 现有文件必须是合法 TOML，否则拒绝写入（有备份也不该冒险破坏用户配置）
+        try:
+            import tomllib
+            tomllib.loads(existing or "")
+        except ModuleNotFoundError:
+            pass                      # Python < 3.11 没得校验，靠备份兜底
+        except Exception as e:  # noqa: BLE001
+            out["error"] = f"现有 config.toml 不是合法 TOML（{e}），已中止以免覆盖：{p}"
+            return out
+        for line in existing.splitlines():
+            s = line.strip()
+            if s.startswith("["):
+                break
+            m = re.match(r'^\s*model\s*=\s*"?([^"\n]*)"?\s*$', line)
+            if m and not out["old_model"]:
+                out["old_model"] = m.group(1).strip()
+            m2 = re.match(r'^\s*model_provider\s*=\s*"?([^"\n]*)"?\s*$', line)
+            if m2 and not out["old_provider"]:
+                out["old_provider"] = m2.group(1).strip()
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        bak = p.with_name(p.name + f".bak-apiprobe-{ts}")
+        try:
+            shutil.copy2(p, bak)
+            out["backup"] = str(bak)
+        except Exception as e:  # noqa: BLE001
+            out["error"] = f"备份失败，已中止：{e}"
+            return out
+    merged = merge_codex_config(existing, model, base_url, env_key, provider_name, wire_api)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(merged, encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"写入失败：{e}"
+        return out
+    out.update(ok=True, text=merged)
+    return out
+
+
+def install_codex_env_key(env_key: str, value: str, path: str | Path | None = None) -> dict:
+    """把 Key 写进 ~/.codex/.env —— Codex 会加载它，config 里的 env_key 就从这里取值。"""
+    p = Path(path) if path else CODEX_ENV_PATH
+    out = {"ok": False, "path": str(p), "error": "", "backup": ""}
+    if not env_key or not value:
+        out["error"] = "env_key 或 Key 为空"
+        return out
+    lines: list[str] = []
+    if p.exists():
+        try:
+            lines = p.read_text(encoding="utf-8").splitlines()
+        except Exception as e:  # noqa: BLE001
+            out["error"] = f"读取失败：{e}"
+            return out
+        try:
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            bak = p.with_name(p.name + f".bak-apiprobe-{ts}")
+            shutil.copy2(p, bak)
+            out["backup"] = str(bak)
+        except Exception:
+            pass
+    kept = [ln for ln in lines if not ln.strip().startswith(f"{env_key}=")]
+    kept.append(f"{env_key}={value}")
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("\n".join(kept).strip("\n") + "\n", encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"写入失败：{e}"
+        return out
+    out["ok"] = True
+    return out
+
+
+def find_codex_backups(path: str | Path | None = None) -> list[Path]:
+    p = Path(path) if path else CODEX_CONFIG_PATH
+    try:
+        items = [q for q in p.parent.glob(p.name + ".bak*") if q.is_file()]
+    except Exception:
+        return []
+    return sorted(items, key=lambda q: q.stat().st_mtime, reverse=True)
+
+
+def verify_codex_cli(model: str, base_url: str, env_key: str, key: str,
+                     cli_path: str = "", timeout: float = 300.0, log=None,
+                     wire_api: str = "responses") -> dict:
+    """端到端验证：在隔离的 CODEX_HOME 里跑 `codex exec "Reply with exactly: PONG"`。"""
+    def L(msg):
+        if log:
+            log(msg)
+
+    res = {"ok": False, "cli": "", "cmd": "", "result": "", "error": "", "config_home": "",
+           "raw": "", "wire_api": wire_api}
+    cli = cli_path or find_codex_cli()
+    if cli and not Path(cli).exists():
+        try:
+            if not shutil.which(cli):
+                cli = ""
+        except Exception:
+            cli = ""
+    res["cli"] = cli
+    if not cli:
+        res["error"] = "没找到 codex 命令（装 Codex CLI，或用桌面版自带的 codex.exe）"
+        return res
+
+    home = Path(tempfile.mkdtemp(prefix="api_probe_codex_"))
+    work = Path(tempfile.mkdtemp(prefix="api_probe_codexwork_"))
+    res["config_home"] = str(home)
+    try:
+        (home / "config.toml").write_text(
+            merge_codex_config("", model, base_url, env_key, "API Probe", wire_api),
+            encoding="utf-8")
+        (home / ".env").write_text(f"{env_key}={key}\n", encoding="utf-8")
+        last = work / "last.txt"
+        args = [cli, "exec", CODEX_PING_PROMPT, "-C", str(work), "--skip-git-repo-check",
+                "--ephemeral", "-s", "read-only", "-o", str(last)]
+        if cli.lower().endswith((".cmd", ".bat")):
+            args = ["cmd", "/c"] + args
+        res["cmd"] = " ".join(args)
+        run_env = dict(os.environ)
+        run_env["CODEX_HOME"] = str(home)
+        run_env[env_key] = key
+        L(f"  执行：{res['cmd']}（CODEX_HOME={home}）")
+        try:
+            cp = subprocess.run(args, env=run_env, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=timeout,
+                                cwd=str(work))
+        except subprocess.TimeoutExpired:
+            res["error"] = f"执行超时（>{timeout:.0f}s）"
+            return res
+        except Exception as e:  # noqa: BLE001
+            res["error"] = f"执行失败：{type(e).__name__}: {e}"
+            return res
+        text = ""
+        if last.exists():
+            try:
+                text = last.read_text(encoding="utf-8", errors="replace").strip()
+            except Exception:
+                text = ""
+        if not text:
+            text = (cp.stdout or "").strip()
+        res["result"] = text[-600:]
+        res["raw"] = ((cp.stdout or "") + "\n" + (cp.stderr or "")).strip()[-2000:]
+        res["ok"] = "PONG" in text
+        if not res["ok"]:
+            tail = (cp.stderr or "").strip() or (cp.stdout or "").strip()
+            res["error"] = tail[-400:] or "输出里没有 PONG"
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+        shutil.rmtree(work, ignore_errors=True)
+    return res
+
+
+def render_codex_launcher(env_key: str, key: str, codex_exe: str = "",
+                          codex_home: str = "") -> str:
+    """启动脚本：临时设好环境变量再拉起 codex（CRLF + 纯 ASCII）。"""
+    lines = ["@echo off",
+             "rem Codex launcher generated by api_probe - keep this file ASCII-only,",
+             "rem because cmd.exe parses .bat with the OEM code page."]
+    if codex_home:
+        lines.append(f'set "CODEX_HOME={codex_home}"')
+    lines.append(f'set "{env_key}={key}"')
+    lines.append(f'"{codex_exe}" %*' if codex_exe else "codex %*")
+    return "\r\n".join(lines) + "\r\n"
+
+
+def write_codex_launcher(env_key: str, key: str, path: str | Path,
+                         codex_exe: str = "", codex_home: str = "") -> dict:
+    out = {"ok": False, "path": str(path), "error": ""}
+    for name, val in ((env_key, key), ("CODEX_HOME", codex_home), ("codex", codex_exe)):
+        if val and not str(val).isascii():
+            out["error"] = (f"{name} 的值含非 ASCII 字符，没法安全写进 .bat"
+                            "（cmd 按 OEM 码页读批处理）——请改用写 config.toml + .env 的方式")
+            return out
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(render_codex_launcher(env_key, key, codex_exe, codex_home),
+                     encoding="ascii", newline="")
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"写入失败：{e}"
+        return out
+    out["ok"] = True
+    return out
+
+
+# =====================================================================
+# 九、图形界面
 # =====================================================================
 
 # 「站点」下拉里那个不落盘的临时项
@@ -1834,9 +2279,11 @@ class ProbeApp:
         self.adhoc: dict = {"name": ADHOC_SITE, "url": "", "key": "", "model": ""}
         self._active_site = ADHOC_SITE            # 当前已装载进输入框的那一格
         # Claude Code 接入
-        self.cc_state: dict = {}                  # 最近一次通道检测结果
+        self.cc_state: dict = {}                  # 最近一次 Anthropic 通道检测结果
+        self.codex_state: dict = {}               # 最近一次 OpenAI 通道检测结果
         self.cc_model_vars: dict = {}             # 别名 -> (StringVar, Combobox)
         self.tab_claude = None
+        self.tab_codex = None
 
         root.title(f"{APP_NAME} v{APP_VERSION}")
         root.geometry("1180x760")
@@ -1947,6 +2394,8 @@ class ProbeApp:
         self.btn_gen.pack(side="left", padx=6)
         ttk.Button(btns, text="③  接入 Claude Code",
                    command=self.goto_claude_tab).pack(side="left", padx=6)
+        ttk.Button(btns, text="④  接入 Codex",
+                   command=self.goto_codex_tab).pack(side="left", padx=6)
         self.btn_flow = ttk.Button(btns, text="▶  全流程（探测 → 测速 → 接入）",
                                    command=self.run_full_flow)
         self.btn_flow.pack(side="left", padx=(14, 4))
@@ -1966,6 +2415,7 @@ class ProbeApp:
         self._build_tab_models()
         self._build_tab_batch()
         self._build_tab_claude()
+        self._build_tab_codex()
         self._build_tab_log()
 
         # 底部状态
@@ -2186,6 +2636,103 @@ class ProbeApp:
         self.txt_cc.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
         vs.pack(side="right", fill="y", pady=6, padx=(0, 6))
 
+    def _build_tab_codex(self):
+        tk, ttk = self.tk, self.ttk
+        frame = ttk.Frame(self.nb)
+        self.nb.add(frame, text="  Codex (OpenAI)  ")
+        self.tab_codex = frame
+
+        head = ttk.LabelFrame(
+            frame, text=" ④ 接入 Codex —— 前提：网关提供 /v1/responses 或 /v1/chat/completions；本机需有 codex CLI ")
+        head.pack(fill="x", padx=6, pady=(6, 4))
+        r1 = ttk.Frame(head)
+        r1.pack(fill="x", padx=8, pady=(6, 2))
+        self.btn_codex_check = ttk.Button(r1, text="检测通道（responses / chat）",
+                                          command=self.codex_check)
+        self.btn_codex_check.pack(side="left")
+        ttk.Label(r1, text="（用当前站点的地址与 Key；结果里的 wire_api 会写进配置）",
+                  style="Hint.TLabel").pack(side="left", padx=6)
+        self.lbl_codex_cli = ttk.Label(r1, text="", style="Hint.TLabel")
+        self.lbl_codex_cli.pack(side="right")
+
+        self.tv_codex = ttk.Treeview(head, columns=("k", "v"), show="headings", height=6)
+        self.tv_codex.heading("k", text="项目")
+        self.tv_codex.heading("v", text="结果")
+        self.tv_codex.column("k", width=110, anchor="w", stretch=False)
+        self.tv_codex.column("v", width=880, anchor="w")
+        self.tv_codex.pack(fill="x", padx=8, pady=(2, 8))
+        for lvl, color in COLORS.items():
+            self.tv_codex.tag_configure(lvl, foreground=color)
+
+        mapf = ttk.LabelFrame(frame, text=" 模型与 Provider（写入 ~/.codex/config.toml） ")
+        mapf.pack(fill="x", padx=6, pady=4)
+        grid = ttk.Frame(mapf)
+        grid.pack(fill="x", padx=8, pady=(6, 2))
+        ttk.Label(grid, text="默认模型").grid(row=0, column=0, sticky="w", padx=(0, 4), pady=3)
+        self.var_codex_model = tk.StringVar()
+        self.cmb_codex_model = ttk.Combobox(grid, textvariable=self.var_codex_model, width=32,
+                                            font=self.mono_font)
+        self.cmb_codex_model.grid(row=0, column=1, sticky="we", padx=(0, 16), pady=3)
+        ttk.Label(grid, text="base_url").grid(row=0, column=2, sticky="w", padx=(0, 4), pady=3)
+        self.var_codex_base = tk.StringVar()
+        ttk.Entry(grid, textvariable=self.var_codex_base, width=34,
+                  font=self.mono_font).grid(row=0, column=3, sticky="we", pady=3)
+        ttk.Label(grid, text="Key 环境变量").grid(row=1, column=0, sticky="w", padx=(0, 4), pady=3)
+        self.var_codex_envkey = tk.StringVar(value="CODEX_API_KEY")
+        ttk.Entry(grid, textvariable=self.var_codex_envkey, width=32,
+                  font=self.mono_font).grid(row=1, column=1, sticky="we", padx=(0, 16), pady=3)
+        ttk.Label(grid, text="wire_api").grid(row=1, column=2, sticky="w", padx=(0, 4), pady=3)
+        self.var_codex_wire = tk.StringVar(value="（检测后自动填）")
+        c = ttk.Combobox(grid, textvariable=self.var_codex_wire, width=14, state="readonly",
+                         values=["responses", "chat"])
+        c.grid(row=1, column=3, sticky="w", pady=3)
+        grid.columnconfigure(1, weight=1)
+        grid.columnconfigure(3, weight=1)
+        r2 = ttk.Frame(mapf)
+        r2.pack(fill="x", padx=8, pady=(0, 6))
+        ttk.Button(r2, text="从当前站点模型列表挑一个",
+                   command=self.codex_autofill).pack(side="left")
+        ttk.Label(r2, text="（优先 gpt-6 / gpt-5 / gpt-4.1 / o 系列；也可手打）",
+                  style="Hint.TLabel").pack(side="left", padx=6)
+
+        act = ttk.LabelFrame(frame, text=" 接入方式（可多选） ")
+        act.pack(fill="x", padx=6, pady=4)
+        self.codex_write_config = tk.BooleanVar(value=True)
+        self.codex_write_env = tk.BooleanVar(value=True)
+        self.codex_write_launcher = tk.BooleanVar(value=False)
+        self.codex_run_verify = tk.BooleanVar(value=True)
+        ttk.Checkbutton(act, text="写入 ~/.codex/config.toml（只合并 provider 与 model，改前备份）",
+                        variable=self.codex_write_config).pack(anchor="w", padx=8, pady=(6, 2))
+        ttk.Checkbutton(act, text="把 Key 写进 ~/.codex/.env（Codex 的 env_key 机制；明文，改前备份）",
+                        variable=self.codex_write_env).pack(anchor="w", padx=8, pady=2)
+        r3 = ttk.Frame(act)
+        r3.pack(fill="x", padx=8, pady=2)
+        ttk.Checkbutton(r3, text="生成启动脚本（临时设环境变量再启动 codex）",
+                        variable=self.codex_write_launcher).pack(side="left")
+        ttk.Checkbutton(r3, text="运行端到端验证（codex exec PONG，隔离 CODEX_HOME）",
+                        variable=self.codex_run_verify).pack(side="left", padx=(16, 0))
+        r4 = ttk.Frame(act)
+        r4.pack(fill="x", padx=8, pady=(2, 8))
+        self.btn_codex_install = ttk.Button(r4, text="▶  一键接入 Codex", command=self.codex_install,
+                                            state="disabled")
+        self.btn_codex_install.pack(side="left")
+        self.lbl_codex_gate = ttk.Label(r4, text="", style="Hint.TLabel")
+        self.lbl_codex_gate.pack(side="left", padx=8)
+        ttk.Button(r4, text="仅预览配置", command=self.codex_preview).pack(side="left", padx=4)
+        ttk.Button(r4, text="复制临时命令", command=self.codex_copy_oneliner).pack(side="left", padx=4)
+        ttk.Button(r4, text="恢复上次备份", command=self.codex_restore).pack(side="left", padx=(14, 4))
+        ttk.Button(r4, text="打开 ~/.codex", command=self.codex_open_dir).pack(side="left")
+
+        logf = ttk.LabelFrame(frame, text=" 执行日志 ")
+        logf.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.txt_codex = tk.Text(logf, font=self.mono_font, wrap="word", height=8,
+                                 background="#111827", foreground="#e5e7eb",
+                                 insertbackground="#e5e7eb")
+        vs = ttk.Scrollbar(logf, orient="vertical", command=self.txt_codex.yview)
+        self.txt_codex.configure(yscrollcommand=vs.set)
+        self.txt_codex.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
+        vs.pack(side="right", fill="y", pady=6, padx=(0, 6))
+
     def _build_tab_log(self):
         tk, ttk = self.tk, self.ttk
         frame = ttk.Frame(self.nb)
@@ -2222,7 +2769,7 @@ class ProbeApp:
         self.btn_gen.configure(state="disabled")
         self.btn_batch.configure(state="disabled")
         self.btn_stop.configure(state="normal")
-        self._set_cc_busy(True)
+        self._set_action_busy(True)
         self.tv_ov.delete(*self.tv_ov.get_children())
         self.tv_models.delete(*self.tv_models.get_children())
         self.tv_cc.delete(*self.tv_cc.get_children())
@@ -2262,33 +2809,59 @@ class ProbeApp:
         self.cc_state = ch
         if ch:
             self._render_cc_check(ch)
+        och = res.get("channel_openai") or {}
+        self.codex_state = och
+        if och:
+            self._render_codex_check(och)
         ids = [str(m.get("id") or "") for m in (site.get("models") or []) if m.get("id")]
         mm = res.get("model_map") or {}
         for k, (var, cmb) in self.cc_model_vars.items():
             cmb.configure(values=ids)
             if mm.get(k):
                 var.set(mm[k])
+        cmb_cx = self.cmb_codex_model
+        cmb_cx.configure(values=ids)
+        if res.get("codex_model"):
+            self.var_codex_model.set(res["codex_model"])
+        self.var_codex_base.set(codex_base_url_for_gateway(self.var_url.get().strip()))
         cli = find_claude_cli()
         self.lbl_cc_cli.configure(text=("CLI：" + cli) if cli
                                   else "没找到 claude 命令（端到端验证会跳过）")
+        cx_cli = find_codex_cli()
+        self.lbl_codex_cli.configure(text=("CLI：" + cx_cli) if cx_cli
+                                     else "没找到 codex（端到端验证会跳过）")
         for s in res.get("steps", []):
             mark = {True: "✔", False: "✘"}.get(s.get("ok"), "·")
-            self._cc_log_append(f"{mark} [{s['no']}/4] {s['text']}"
-                                + (f" → {s['detail']}" if s.get("detail") else ""))
+            line = (f"{mark} [{s['no']}/4] {s['text']}"
+                    + (f" → {s['detail']}" if s.get("detail") else ""))
+            self._cc_log_append(line)
+            self._codex_log_append(line)
         self._cc_log_append(f"结论：{res.get('verdict', '')}")
-        self.nb.select(self.tab_claude)
+        self._codex_log_append(f"结论：{res.get('verdict', '')}")
+        ready_claude = self.cc_ready()[0]
+        ready_codex = self.codex_ready()[0]
+        self.nb.select(self.tab_claude if ready_claude else
+                       (self.tab_codex if ready_codex else self.tab_claude))
         self._set_status("全流程完成" if res.get("ok") else "全流程完成（有未通过项，见日志）")
         self.lbl_summary.configure(text=res.get("verdict", ""))
         self._log_append(f"=== 全流程完成：{res.get('verdict', '')} ===")
         self._finish_busy()
-        if res.get("ok") and self.cc_write_settings.get() and not res.get("stopped"):
-            from tkinter import messagebox
-            if messagebox.askyesno(
-                    "全流程通过",
-                    "模型能跑、Anthropic 通道也通了。\n\n"
-                    "现在把这套配置写进 Claude Code 吗？\n"
-                    "（合并进 ~/.claude/settings.json，改前自动备份）"):
+        if res.get("stopped"):
+            return
+        from tkinter import messagebox
+        if ready_claude and self.cc_write_settings.get():
+            extra = "　Codex 通道也可用，可在 Codex 页点「一键接入 Codex」。" if ready_codex else ""
+            if messagebox.askyesno("全流程通过",
+                                   "模型能跑、Claude Code 通道也通了。\n\n"
+                                   "现在把这套配置写进 Claude Code 吗？\n"
+                                   "（合并进 ~/.claude/settings.json，改前自动备份）" + extra):
                 self.cc_install()
+        elif ready_codex and self.codex_write_config.get():
+            if messagebox.askyesno("全流程通过",
+                                   "模型能跑、OpenAI 通道也通了。\n\n"
+                                   "现在把这套配置写进 Codex 吗？\n"
+                                   "（合并进 ~/.codex/config.toml，改前自动备份）"):
+                self.codex_install()
 
     # ---------------- Claude Code 接入 ----------------
     def _open_path(self, path) -> None:
@@ -2348,20 +2921,25 @@ class ProbeApp:
         except Exception:
             pass
 
-    def _set_cc_busy(self, flag: bool) -> None:
+    def _set_action_busy(self, flag: bool) -> None:
+        """忙碌时禁用「检测 / 全流程」，并按各自门禁决定两个「一键接入」是否可点。"""
         state = "disabled" if flag else "normal"
-        for btn in (getattr(self, "btn_cc_check", None), getattr(self, "btn_flow", None)):
+        for btn in (getattr(self, "btn_cc_check", None), getattr(self, "btn_flow", None),
+                    getattr(self, "btn_codex_check", None)):
             try:
                 btn.configure(state=state)
             except Exception:
                 pass
         if flag:
-            try:
-                self.btn_cc_install.configure(state="disabled")
-            except Exception:
-                pass
+            for btn in (getattr(self, "btn_cc_install", None),
+                        getattr(self, "btn_codex_install", None)):
+                try:
+                    btn.configure(state="disabled")
+                except Exception:
+                    pass
         else:
-            self._refresh_cc_gate()          # 空闲时按门禁决定「一键接入」是否可点
+            self._refresh_cc_gate()
+            self._refresh_codex_gate()
 
     def goto_claude_tab(self):
         self.nb.select(self.tab_claude)
@@ -2408,7 +2986,7 @@ class ProbeApp:
         model = self.cc_model_vars["default"][0].get().strip() or self.var_model.get().strip()
         self.stop_event.clear()
         self.busy = True
-        self._set_cc_busy(True)
+        self._set_action_busy(True)
         self._set_status("正在检测 Anthropic Messages 通道…")
         self._cc_log_append(f"=== 检测通道：{base.rstrip('/')}/v1/messages"
                             f"（模型 {model or '未指定'}）===")
@@ -2523,7 +3101,7 @@ class ProbeApp:
         timeout = max(60.0, self._timeout() * 6)
         self.stop_event.clear()
         self.busy = True
-        self._set_cc_busy(True)
+        self._set_action_busy(True)
         self._set_status("正在接入 Claude Code…")
         self._cc_log_append(f"=== 一键接入开始（站点：{site}）===")
 
@@ -2612,6 +3190,280 @@ class ProbeApp:
     def cc_open_dir(self):
         self._open_path(CLAUDE_SETTINGS_PATH.parent)
 
+    # ---------------- Codex（OpenAI 格式）接入 ----------------
+    def codex_log_msg(self, msg: str) -> None:
+        self.q.put(("codex_log", msg))
+
+    def _codex_log_append(self, msg: str) -> None:
+        self.txt_codex.insert("end", f"{time.strftime('%H:%M:%S')}  {msg}\n")
+        self.txt_codex.see("end")
+
+    def goto_codex_tab(self):
+        self.nb.select(self.tab_codex)
+        self.codex_refresh_context()
+        self._set_status("先点「检测通道（responses / chat）」，通过后再「一键接入 Codex」")
+
+    def codex_refresh_context(self):
+        """刷新可选模型、base_url、codex 路径。"""
+        models = (self.site_result or {}).get("models") or []
+        ids = [str(m.get("id") or "") for m in models if m.get("id")]
+        self.cmb_codex_model.configure(values=ids)
+        if not self.var_codex_model.get():
+            self.var_codex_model.set(
+                suggest_codex_model(models, fallback=self.var_model.get().strip()))
+        self.var_codex_base.set(codex_base_url_for_gateway(self.var_url.get().strip()))
+        cli = find_codex_cli()
+        self.lbl_codex_cli.configure(text=("CLI：" + cli) if cli
+                                     else "没找到 codex（端到端验证会跳过）")
+
+    def codex_autofill(self):
+        models = (self.site_result or {}).get("models") or []
+        if not models:
+            self._set_status("还没有模型列表：先在主界面点「① 获取模型列表」")
+            return
+        pick = suggest_codex_model(models, fallback=self.var_model.get().strip())
+        if pick:
+            self.var_codex_model.set(pick)
+            self._set_status(f"已选默认模型：{pick}")
+
+    def codex_ready(self) -> tuple[bool, str]:
+        """门禁：生成测试通过 + OpenAI 通道检测通过，才允许「一键接入 Codex」。"""
+        gen_ok = bool((self.site_result or {}).get("ok"))
+        ch = self.codex_state or {}
+        if not gen_ok:
+            return False, "第 ② 步生成测试还没通过：先点「② 对选中模型发测试」或「▶ 全流程」"
+        if ch.get("ok"):
+            return True, ""
+        if any(t.get("model_not_found") for t in ch.get("tried") or []):
+            return False, "通道路径通了但模型不可用：换一个模型后再点「检测通道」"
+        if ch:
+            return False, f"OpenAI 通道未通过：{ch.get('verdict') or '未知原因'}"
+        return False, "还没检测 OpenAI 通道：先点「检测通道（responses / chat）」或「▶ 全流程」"
+
+    def _refresh_codex_gate(self) -> None:
+        ok, why = self.codex_ready()
+        try:
+            self.btn_codex_install.configure(state="normal" if ok else "disabled")
+            self.lbl_codex_gate.configure(
+                text="已解锁，可以接入" if ok else f"未解锁：{why}",
+                foreground=COLORS["ok"] if ok else COLORS["muted"])
+        except Exception:
+            pass
+
+    def codex_check(self):
+        if self.busy:
+            self._set_status("正在测试中，请稍候…")
+            return
+        base = self.var_url.get().strip()
+        if not base:
+            self._set_status("请先填写 API 地址")
+            return
+        key = self.var_key.get().strip()
+        model = self.var_codex_model.get().strip() or self.var_model.get().strip()
+        self.stop_event.clear()
+        self.busy = True
+        self._set_action_busy(True)
+        self._set_status("正在检测 OpenAI 通道…")
+        self._codex_log_append(f"=== 检测 OpenAI 通道：{codex_base_url_for_gateway(base)}"
+                               f"（模型 {model or '未指定'}）===")
+        timeout, verify = self._timeout(), bool(self.var_verify.get())
+
+        def work():
+            try:
+                res = check_openai_channel(base, key, model, timeout=timeout, verify=verify,
+                                           log=self.codex_log_msg, stop_event=self.stop_event)
+                self.q.put(("codex_check_done", res))
+            except Exception as e:  # noqa: BLE001
+                self.q.put(("fatal", f"{type(e).__name__}: {e}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _render_codex_check(self, res: dict):
+        self.codex_state = res
+        tv = self.tv_codex
+        tv.delete(*tv.get_children())
+
+        def add(k, v, level="info"):
+            tv.insert("", "end", values=(k, v), tags=(level,))
+
+        add("结论", res.get("verdict", ""), res.get("verdict_level", "info"))
+        add("wire_api（要写进配置）", res.get("wire_api") or "-",
+            "ok" if res.get("wire_api") else "warn")
+        add("base_url（Codex 用）", res.get("base_url", ""), "muted")
+        add("HTTP 状态", str(res.get("status") or "-"))
+        add("耗时", f"{res['latency_ms']:.0f} ms" if res.get("latency_ms") else "-")
+        add("返回内容", (res.get("reply") or "-").replace("\n", " ")[:180])
+        for t in res.get("tried", []):
+            add(f"尝试 {t.get('wire_api')}",
+                f"HTTP {t.get('status') or '-'}　{t.get('error') or ''}"[:220],
+                "ok" if t.get("ok") else "warn")
+        if res.get("wire_api"):
+            self.var_codex_wire.set(res["wire_api"])
+        self._codex_log_append(f"检测结论：{res.get('verdict', '')}")
+        self._set_status("OpenAI 通道检测完成")
+        self._finish_busy()
+
+    def codex_params(self):
+        model = self.var_codex_model.get().strip() or self.var_model.get().strip()
+        base_url = self.var_codex_base.get().strip() or \
+            codex_base_url_for_gateway(self.var_url.get().strip())
+        env_key = self.var_codex_envkey.get().strip() or "CODEX_API_KEY"
+        wire = self.var_codex_wire.get().strip()
+        if wire not in ("responses", "chat"):
+            wire = (self.codex_state or {}).get("wire_api") or "responses"
+        return model, base_url, env_key, wire
+
+    def codex_preview(self):
+        model, base_url, env_key, wire = self.codex_params()
+        if not base_url or not model:
+            self._set_status("需要地址与模型才能预览")
+            return
+        existing = ""
+        try:
+            if CODEX_CONFIG_PATH.exists():
+                existing = CODEX_CONFIG_PATH.read_text(encoding="utf-8")
+        except Exception:
+            pass
+        merged = merge_codex_config(existing, model, base_url, env_key,
+                                    self.var_site.get() or "API Probe", wire)
+        self._codex_log_append("=== 预览：合并后的 ~/.codex/config.toml（只显示前 30 行）===")
+        for line in merged.splitlines()[:30]:
+            self._codex_log_append(line)
+        self._set_status("预览已打印到下方日志")
+
+    def codex_copy_oneliner(self):
+        model, base_url, env_key, wire = self.codex_params()
+        if not base_url or not model or not self.var_key.get().strip():
+            self._set_status("需要地址、模型与 Key 才能生成临时命令")
+            return
+        cmd = (f'codex exec -c model="{model}" '
+               f'-c model_provider="{CODEX_PROVIDER_ID}" '
+               f'-c model_providers.{CODEX_PROVIDER_ID}.base_url="{base_url}" '
+               f'-c model_providers.{CODEX_PROVIDER_ID}.wire_api="{wire}" '
+               f'-c model_providers.{CODEX_PROVIDER_ID}.env_key="{env_key}" '
+               f'"hi"')
+        self.root.clipboard_clear()
+        self.root.clipboard_append(cmd)
+        self._codex_log_append("已复制临时命令（不含 Key；运行前先设好 "
+                               f"{env_key} 环境变量）：")
+        self._codex_log_append(cmd)
+        self._set_status("临时命令已复制到剪贴板")
+
+    def codex_install(self):
+        from tkinter import messagebox
+        if self.busy:
+            self._set_status("正在测试中，请稍候…")
+            return
+        ready, why = self.codex_ready()
+        if not ready:
+            self._set_status(why)
+            try:
+                messagebox.showwarning("还不能接入 Codex", why)
+            except Exception:
+                pass
+            return
+        model, base_url, env_key, wire = self.codex_params()
+        if not model or not base_url:
+            self._set_status("缺少模型或地址")
+            return
+        key = self.var_key.get().strip()
+        do_config = bool(self.codex_write_config.get())
+        do_env = bool(self.codex_write_env.get())
+        do_launcher = bool(self.codex_write_launcher.get())
+        do_verify = bool(self.codex_run_verify.get())
+        if not any((do_config, do_env, do_launcher, do_verify)):
+            self._set_status("没有勾选任何接入方式")
+            return
+        if (do_env or do_launcher) and not key:
+            if not messagebox.askyesno("没有 Key", "要写 .env / 生成启动脚本，但没有填 Key。继续？"):
+                return
+        site = self.var_site.get()
+        slug = slugify(site if site != ADHOC_SITE else "custom")
+        outdir = CLAUDE_OUTPUT_DIR / f"codex-{slug}"
+        cli = find_codex_cli()
+        timeout = max(60.0, self._timeout() * 6)
+        self.stop_event.clear()
+        self.busy = True
+        self._set_action_busy(True)
+        self._set_status("正在接入 Codex…")
+        self._codex_log_append(f"=== 一键接入 Codex 开始（站点：{site}，模型：{model}）===")
+
+        def work():
+            summary = {"ok": True, "lines": []}
+
+            def note(msg, ok=True):
+                summary["lines"].append(msg)
+                summary["ok"] = summary["ok"] and ok
+                self.codex_log_msg(msg)
+
+            try:
+                if do_config:
+                    r = install_codex_config(model, base_url, env_key,
+                                             site or "API Probe", wire)
+                    if r["ok"]:
+                        old = (f"（原 model={r['old_model']} / provider={r['old_provider']}，"
+                               f"已备份）" if r["old_model"] or r["old_provider"] else
+                               "（原本没有配置文件）")
+                        note(f"✔ 已写入 {r['path']}{old}")
+                    else:
+                        note(f"✘ 写 config.toml 失败：{r['error']}", ok=False)
+                if do_env:
+                    r = install_codex_env_key(env_key, key)
+                    note(f"✔ 已把 Key 写进 {r['path']}（变量名 {env_key}）"
+                         + (f"，备份 {r['backup']}" if r["backup"] else "")
+                         if r["ok"] else f"✘ 写 .env 失败：{r['error']}", ok=r["ok"])
+                if do_launcher:
+                    lp = outdir / f"start-codex-{slug}.bat"
+                    r = write_codex_launcher(env_key, key, lp, cli)
+                    note(f"✔ 启动脚本：{r['path']}" if r["ok"]
+                         else f"✘ 启动脚本失败：{r['error']}", ok=r["ok"])
+                if do_verify:
+                    note("… 正在跑端到端验证（codex exec PONG），首次可能要几十秒")
+                    vr = verify_codex_cli(model, base_url, env_key, key, cli_path=cli,
+                                          timeout=timeout, log=self.codex_log_msg, wire_api=wire)
+                    if vr["ok"]:
+                        note(f"✔ 端到端验证通过：{vr['result'].strip()[:120]!r}")
+                    else:
+                        note(f"✘ 端到端验证未通过：{vr['error']}", ok=False)
+                self.q.put(("codex_install_done", summary))
+            except Exception as e:  # noqa: BLE001
+                self.q.put(("fatal", f"{type(e).__name__}: {e}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finish_codex_install(self, summary: dict):
+        ok = bool(summary.get("ok"))
+        self._codex_log_append("=== 一键接入 Codex 完成 ===" if ok
+                               else "=== 一键接入 Codex 完成（有失败项，见上）===")
+        self._set_status("Codex 接入完成" if ok else "Codex 接入完成，但有失败项（见日志）")
+        self._finish_busy()
+
+    def codex_restore(self):
+        from tkinter import messagebox
+        baks = find_codex_backups()
+        if not baks:
+            self._set_status("没有找到 config.toml 的备份")
+            return
+        newest = baks[0]
+        if not messagebox.askyesno("恢复备份",
+                                   f"用这个备份覆盖 ~/.codex/config.toml？\n\n{newest}\n\n"
+                                   "（当前文件会先另存一份再覆盖）"):
+            return
+        try:
+            if CODEX_CONFIG_PATH.exists():
+                ts = time.strftime("%Y%m%d-%H%M%S")
+                shutil.copy2(CODEX_CONFIG_PATH,
+                             CODEX_CONFIG_PATH.with_name(CODEX_CONFIG_PATH.name
+                                                         + f".bak-apiprobe-{ts}"))
+            shutil.copy2(newest, CODEX_CONFIG_PATH)
+            self._codex_log_append(f"✔ 已从备份恢复：{newest}")
+            self._set_status("已恢复备份")
+        except Exception as e:  # noqa: BLE001
+            self._set_status(f"恢复失败：{e}")
+
+    def codex_open_dir(self):
+        self._open_path(CODEX_HOME)
+
     # ---------------- 小工具 ----------------
     def _toggle_key(self):
         self.ent_key.configure(show="" if self.var_show.get() else "*")
@@ -2661,13 +3513,16 @@ class ProbeApp:
         """站点/Key 变了：上一次拉到的模型列表与测试结果作废。"""
         self.site_result = None
         self.last_result = None
+        self.cc_state = {}
+        self.codex_state = {}
         self._site_signature = ""
         self.btn_gen.configure(state="disabled")
         self.lbl_picked.configure(text="（未选择）")
         self.tv_ov.delete(*self.tv_ov.get_children())
         self.tv_models.delete(*self.tv_models.get_children())
         self.lbl_models.configure(text="（尚未获取列表）")
-        self._refresh_cc_gate()               # 站点一变，接入门禁立刻关上
+        self._refresh_cc_gate()               # 站点一变，两个接入门禁立刻关上
+        self._refresh_codex_gate()
         try:
             self.nb.select(0)
         except Exception:
@@ -3254,6 +4109,12 @@ class ProbeApp:
                     self._render_cc_check(data)
                 elif kind == "cc_install_done":
                     self._finish_cc_install(data)
+                elif kind == "codex_log":
+                    self._codex_log_append(str(data))
+                elif kind == "codex_check_done":
+                    self._render_codex_check(data)
+                elif kind == "codex_install_done":
+                    self._finish_codex_install(data)
                 elif kind == "flow_done":
                     self._render_flow(data)
                 elif kind == "batch_row":
@@ -3275,7 +4136,7 @@ class ProbeApp:
         self.btn_batch.configure(state="normal")
         self.btn_gen.configure(state="normal" if self.site_result else "disabled")
         self.btn_stop.configure(state="disabled")
-        self._set_cc_busy(False)
+        self._set_action_busy(False)
 
     # ---------------- 渲染 ----------------
     def _render_site(self, res: dict):
@@ -3304,7 +4165,8 @@ class ProbeApp:
         self._log_append(f"=== 第 1 步完成：{res.get('verdict', '')} ===")
         self._finish_busy()
         try:
-            self.cc_refresh_context()          # 顺手把候选模型喂给 Claude Code 页
+            self.cc_refresh_context()          # 顺手把候选模型喂给两个 CLI 接入页
+            self.codex_refresh_context()
         except Exception:
             pass
 
@@ -3558,7 +4420,7 @@ def run_gui() -> int:
 
 
 # =====================================================================
-# 九、自检（本地 mock 服务器，不访问外网）
+# 十、自检（本地 mock 服务器，不访问外网）
 # =====================================================================
 
 def _mock_server(mode: str):
@@ -3635,7 +4497,28 @@ def _mock_server(mode: str):
                 payload = json.loads(self.rfile.read(length) or b"{}")
             except Exception:
                 payload = {}
+            if path == "/v1/responses":
+                # 模拟 Responses API（Codex 的首选 wire_api）
+                mode_ = getattr(self.server, "mode", "")
+                if mode_ == "chatonly":
+                    return self._send(404, {"error": {"message": "not found"}})
+                auth_hdr = self.headers.get("Authorization") or ""
+                if mode_ == "badkey" or not auth_hdr.lower().startswith("bearer sk-mock"):
+                    return self._send(401, {"error": {"message": "无效的令牌 (request id: mock-1)",
+                                                      "type": "new_api_error"}})
+                model = str((payload or {}).get("model") or "gpt-4o")
+                return self._send(200, {
+                    "id": "resp_mock", "object": "response", "status": "completed",
+                    "model": model,
+                    "output": [{"type": "message", "role": "assistant",
+                                "content": [{"type": "output_text", "text": "PONG"}]}],
+                    "usage": {"input_tokens": 9, "output_tokens": 1, "total_tokens": 10}})
             if path == "/v1/chat/completions":
+                mode_ = getattr(self.server, "mode", "")
+                auth_hdr = self.headers.get("Authorization") or ""
+                if mode_ == "badkey" or not auth_hdr.lower().startswith("bearer sk-mock"):
+                    return self._send(401, {"error": {"message": "无效的令牌 (request id: mock-1)",
+                                                      "type": "new_api_error"}})
                 model = (payload or {}).get("model", "gpt-4o")
                 # 故意返回一个不同的模型名，用于验证「掺水/映射」告警
                 fake = "gpt-4o-mini" if model != "gpt-4o-mini" else "gpt-4o"
@@ -3946,7 +4829,12 @@ def selftest() -> int:
     srv, base = _mock_server("openaionly")
     try:
         pipe2 = run_full_pipeline(base, "sk-mock", timeout=10, deep=False)
-        check("只有 OpenAI 协议时全流程判为未通过", pipe2["ok"] is False, f"-> {pipe2['verdict']}")
+        check("纯 OpenAI 协议时 Claude Code 通道判为不可用",
+              (pipe2["channel"] or {}).get("ok") is False, f"-> {pipe2['channel'].get('verdict')}")
+        check("但 Codex 通道可用，全流程仍通过", pipe2["ok"] is True, f"-> {pipe2['verdict']}")
+        check("给出了正确的 wire_api",
+              (pipe2["channel_openai"] or {}).get("wire_api") == "responses",
+              f"-> {(pipe2['channel_openai'] or {}).get('wire_api')}")
         check("此时模型测试本身是通过的", (pipe2["gen"] or {}).get("ok") is True)
     finally:
         srv.shutdown()
@@ -4033,6 +4921,129 @@ def selftest() -> int:
         check("找不到 CLI 时优雅失败",
               missing["ok"] is False and "没找到" in missing["error"], f"-> {missing['error']}")
 
+    print("\n[11] Codex（OpenAI 格式）接入")
+    check("Codex base_url 自动补 /v1",
+          codex_base_url_for_gateway("https://gw.example.com") == "https://gw.example.com/v1")
+    check("Codex base_url 不会重复 /v1",
+          codex_base_url_for_gateway("https://gw.example.com/v1/") == "https://gw.example.com/v1")
+    check("Codex base_url 能从完整端点还原",
+          codex_base_url_for_gateway("https://gw.example.com/v1/chat/completions")
+          == "https://gw.example.com/v1")
+
+    srv, base = _mock_server("openai")
+    try:
+        oc = check_openai_channel(base, "sk-mock", "gpt-4o", timeout=10)
+        check("支持 Responses API 的站优先用 responses", oc["wire_api"] == "responses",
+              f"-> {oc['wire_api']} {oc['verdict']}")
+        check("OpenAI 通道检测通过", oc["ok"] is True, f"-> {oc['verdict']}")
+        check("拿到了返回文本", "PONG" in oc["reply"], f"-> {oc['reply']!r}")
+        check("base_url 带 /v1", oc["base_url"].endswith("/v1"))
+    finally:
+        srv.shutdown()
+
+    srv, base = _mock_server("chatonly")
+    try:
+        oc2 = check_openai_channel(base, "sk-mock", "gpt-4o", timeout=10)
+        check("只支持 chat 的站自动回落到 chat", oc2["wire_api"] == "chat",
+              f"-> {oc2['wire_api']} {oc2['verdict']}")
+    finally:
+        srv.shutdown()
+
+    srv, base = _mock_server("badkey")
+    try:
+        oc3 = check_openai_channel(base, "sk-bad", "gpt-4o", timeout=10)
+        check("Key 无效时报鉴权失败而不是协议不支持",
+              oc3["ok"] is False and "鉴权失败" in oc3["verdict"], f"-> {oc3['verdict']}")
+    finally:
+        srv.shutdown()
+
+    check("Codex 默认模型优先挑 gpt-5 系",
+          suggest_codex_model([{"id": x} for x in
+                               ["gpt-4o-mini", "text-embedding-3-small", "gpt-5.1-codex",
+                                "gpt-4o", "o3-mini"]]) == "gpt-5.1-codex")
+    check("没有 gpt-5 时退到 gpt-4o 而不是 embedding",
+          suggest_codex_model([{"id": "text-embedding-3-small"}, {"id": "gpt-4o"}]) == "gpt-4o")
+
+    existing_toml = ('model = "old-model"\nmodel_provider = "old_prov"\n'
+                     'approval_policy = "never"\n\n'
+                     '[model_providers.hermes]\nbase_url = "https://x/v1"\n\n'
+                     '[desktop]\ntheme = "dark"\n')
+    merged = merge_codex_config(existing_toml, "gpt-5.1-codex", "https://gw.example.com/v1",
+                                "CODEX_API_KEY", "我的站点", "responses")
+    check("合并后旧的顶层 model 被替换", 'model = "old-model"' not in merged)
+    check("合并后其它顶层键保留", 'approval_policy = "never"' in merged)
+    check("合并后别的 provider 表保留", "[model_providers.hermes]" in merged)
+    check("合并后其它表保留", "[desktop]" in merged)
+    check("写入了自己的 provider 表", f"[model_providers.{CODEX_PROVIDER_ID}]" in merged)
+    check("env_key 与 wire_api 写对",
+          'env_key = "CODEX_API_KEY"' in merged and 'wire_api = "responses"' in merged)
+    check("顶层键排在所有表之前（TOML 硬要求）", merged.index("model =") < merged.index("["))
+    merged2 = merge_codex_config(merged, "gpt-5.1-codex", "https://gw.example.com/v1",
+                                 "CODEX_API_KEY", "我的站点", "responses")
+    check("重复执行不产生重复块",
+          merged2.count(f"[model_providers.{CODEX_PROVIDER_ID}]") == 1)
+    try:
+        import tomllib
+        parsed = tomllib.loads(merged2)
+        check("合并结果是合法 TOML，且值正确",
+              parsed.get("model") == "gpt-5.1-codex"
+              and parsed["model_providers"][CODEX_PROVIDER_ID]["wire_api"] == "responses"
+              and parsed.get("approval_policy") == "never")
+    except ImportError:
+        check("（Python<3.11 无 tomllib，跳过 TOML 解析校验）", True)
+
+    with tempfile.TemporaryDirectory() as td:
+        cp = Path(td) / "config.toml"
+        cp.write_text(existing_toml, encoding="utf-8")
+        r = install_codex_config("gpt-5.1-codex", "https://gw.example.com/v1", "CODEX_API_KEY",
+                                 "我的站点", "responses", path=cp)
+        check("写 config.toml 成功", r["ok"] and cp.exists(), f"-> {r.get('error')}")
+        check("记录下旧的 model/provider",
+              r["old_model"] == "old-model" and r["old_provider"] == "old_prov", f"-> {r}")
+        check("产生备份", bool(r["backup"]) and Path(r["backup"]).exists())
+        cp.write_text("这不是合法 toml [[[", encoding="utf-8")
+        bad = install_codex_config("m", "https://gw/v1", "K", "n", "responses", path=cp)
+        check("坏 TOML 拒绝覆盖", bad["ok"] is False and "合法 TOML" in bad["error"],
+              f"-> {bad['error']}")
+        check("坏文件内容原样保留", cp.read_text(encoding="utf-8") == "这不是合法 toml [[[")
+
+        lp = Path(td) / "start-codex.bat"
+        lr = write_codex_launcher("CODEX_API_KEY", "sk-x", lp, r"C:\tools\codex.exe")
+        body = lp.read_bytes() if lp.exists() else b""
+        check("Codex 启动脚本生成成功", lr["ok"] and bool(body), f"-> {lr.get('error')}")
+        check("启动脚本纯 ASCII", all(b < 128 for b in body))
+        check("启动脚本用 CRLF", b"\r\n" in body)
+        check("启动脚本设了 Key 变量并调用 codex",
+              b'set "CODEX_API_KEY=sk-x"' in body and b"codex.exe" in body)
+        badl = write_codex_launcher("CODEX_API_KEY", "中文Key", Path(td) / "x.bat")
+        check("非 ASCII Key 拒绝写 .bat", badl["ok"] is False and "非 ASCII" in badl["error"])
+
+        ep = Path(td) / ".env"
+        ep.write_text("OTHER=1\nCODEX_API_KEY=sk-old\n", encoding="utf-8")
+        er = install_codex_env_key("CODEX_API_KEY", "sk-new", path=ep)
+        envtxt = ep.read_text(encoding="utf-8")
+        check("写 .env 成功", er["ok"], f"-> {er.get('error')}")
+        check(".env 里同名变量被替换", "CODEX_API_KEY=sk-new" in envtxt
+              and "sk-old" not in envtxt)
+        check(".env 里其它变量保留", "OTHER=1" in envtxt)
+
+        stub_dir = Path(td) / "cstub"
+        stub_dir.mkdir()
+        stub = stub_dir / "codex.cmd"
+        stub.write_text("@echo off\r\necho PONG\r\n", encoding="ascii")
+        vr = verify_codex_cli("gpt-5.1-codex", "https://gw.example.com/v1", "CODEX_API_KEY",
+                              "sk-mock", cli_path=str(stub), timeout=60)
+        check("Codex 端到端验证能识别 PONG", vr["ok"] is True,
+              f"-> {vr.get('error')} {vr.get('result')!r}")
+        check("验证跑在隔离 CODEX_HOME 里", "api_probe_codex_" in vr["config_home"])
+        stub.write_text("@echo off\r\necho nothing useful\r\n", encoding="ascii")
+        vr2 = verify_codex_cli("m", "https://x/v1", "K", "sk-mock", cli_path=str(stub), timeout=60)
+        check("没有 PONG 时判失败", vr2["ok"] is False)
+        missing = verify_codex_cli("m", "https://x/v1", "K", "sk", 
+                                   cli_path=str(Path(td) / "nope.exe"), timeout=5)
+        check("找不到 codex 时优雅失败",
+              missing["ok"] is False and "没找到" in missing["error"], f"-> {missing['error']}")
+
     print(f"\n结果：{ok_count} 通过 / {fail_count} 失败")
     return 1 if fail_count else 0
 
@@ -4046,6 +5057,7 @@ def uitest() -> int:
     import tkinter as tk
     import tempfile
     global CONFIG_PATH, CLAUDE_SETTINGS_PATH, CLAUDE_OUTPUT_DIR
+    global CODEX_HOME, CODEX_CONFIG_PATH, CODEX_ENV_PATH
 
     real_config_path = CONFIG_PATH
     CONFIG_PATH = Path(tempfile.mkdtemp(prefix="api_probe_cfg_")) / "cfg.json"
@@ -4055,6 +5067,14 @@ def uitest() -> int:
     CLAUDE_SETTINGS_PATH = (Path(tempfile.mkdtemp(prefix="api_probe_claude_"))
                             / ".claude" / "settings.json")
     CLAUDE_OUTPUT_DIR = Path(tempfile.mkdtemp(prefix="api_probe_ccout_"))
+    # Codex 同理：绝不碰用户真实的 ~/.codex（那里有他的 provider 配置与 Key）
+    real_codex_home = CODEX_HOME
+    real_codex_config = CODEX_CONFIG_PATH
+    real_codex_env = CODEX_ENV_PATH
+    _codex_home_tmp = Path(tempfile.mkdtemp(prefix="api_probe_codexhome_"))
+    CODEX_HOME = _codex_home_tmp
+    CODEX_CONFIG_PATH = _codex_home_tmp / "config.toml"
+    CODEX_ENV_PATH = _codex_home_tmp / ".env"
 
     enable_dpi_awareness()
     fails = []
@@ -4283,7 +5303,8 @@ def uitest() -> int:
 
         # ---- Claude Code 接入页 ----
         check("Claude Code 标签页已创建", app.tab_claude is not None)
-        check("标签页总数为 5", len(app.nb.tabs()) == 5, f"-> {len(app.nb.tabs())}")
+        check("Codex 标签页已创建", app.tab_codex is not None)
+        check("标签页总数为 6", len(app.nb.tabs()) == 6, f"-> {len(app.nb.tabs())}")
         check("模型映射有五项", len(app.cc_model_vars) == 5, f"-> {list(app.cc_model_vars)}")
 
         srv_cc, base_cc = _mock_server("anthropic")
@@ -4357,6 +5378,49 @@ def uitest() -> int:
             check("启动脚本是纯 ASCII",
                   all(all(b < 128 for b in p.read_bytes()) for p in bats))
             check("接入日志有输出", "一键接入完成" in app.txt_cc.get("1.0", "end-1c"))
+
+            # ---- Codex 页（同一站点：Anthropic mock 也实现了 /v1/responses）----
+            check("门禁：Codex 未检测通道时不能接入", app.codex_ready()[0] is False,
+                  f"-> {app.codex_ready()[1]}")
+            check("Codex 接入按钮默认禁用",
+                  str(app.btn_codex_install["state"]) == "disabled")
+            app.var_codex_model.set("claude-sonnet-5-5")
+            app.codex_check()
+            wait_until(lambda: not app.busy, root)
+            check("Codex 通道检测通过", (app.codex_state or {}).get("ok") is True,
+                  f"-> {(app.codex_state or {}).get('verdict')}")
+            check("检测出 wire_api", (app.codex_state or {}).get("wire_api") in ("responses", "chat"),
+                  f"-> {(app.codex_state or {}).get('wire_api')}")
+            check("检测结果渲染到 Codex 表格", len(app.tv_codex.get_children()) >= 5,
+                  f"-> {len(app.tv_codex.get_children())}")
+            check("门禁：生成测试 + 通道都过了，解锁",
+                  app.codex_ready()[0] is True, f"-> {app.codex_ready()[1]}")
+            check("Codex 接入按钮已可点",
+                  str(app.btn_codex_install["state"]) == "normal")
+
+            app.codex_write_config.set(True)
+            app.codex_write_env.set(True)
+            app.codex_write_launcher.set(True)
+            app.codex_run_verify.set(False)       # 测试里不真去调 codex CLI
+            app.codex_install()
+            wait_until(lambda: not app.busy, root, timeout=40)
+            check("写出了 config.toml", CODEX_CONFIG_PATH.exists(), f"-> {CODEX_CONFIG_PATH}")
+            ctxt = CODEX_CONFIG_PATH.read_text(encoding="utf-8")
+            check("config.toml 里有我们的 provider 表",
+                  f"[model_providers.{CODEX_PROVIDER_ID}]" in ctxt)
+            check("config.toml 的 base_url 带 /v1", "base_url" in ctxt and "/v1" in ctxt)
+            check("config.toml 里 wire_api 已写入", "wire_api" in ctxt)
+            check("写出了 .env", CODEX_ENV_PATH.exists())
+            check(".env 里写进了 Key",
+                  "sk-mock" in CODEX_ENV_PATH.read_text(encoding="utf-8"))
+            cbats = [p for p in CLAUDE_OUTPUT_DIR.rglob("*.bat") if "codex" in p.name.lower()]
+            check("生成了 Codex 启动脚本", bool(cbats), f"-> {cbats}")
+            check("Codex 启动脚本是纯 ASCII",
+                  all(all(b < 128 for b in p.read_bytes()) for p in cbats))
+            check("Codex 日志有输出",
+                  "一键接入 Codex 完成" in app.txt_codex.get("1.0", "end-1c"))
+            check("测试全程用隔离的 CODEX_HOME",
+                  "api_probe_codexhome_" in str(CODEX_CONFIG_PATH), f"-> {CODEX_CONFIG_PATH}")
         finally:
             srv_cc.shutdown()
     except Exception as e:  # noqa: BLE001
@@ -4372,6 +5436,9 @@ def uitest() -> int:
         CONFIG_PATH = real_config_path
         CLAUDE_SETTINGS_PATH = real_claude_settings
         CLAUDE_OUTPUT_DIR = real_claude_outdir
+        CODEX_HOME = real_codex_home
+        CODEX_CONFIG_PATH = real_codex_config
+        CODEX_ENV_PATH = real_codex_env
 
     if fails:
         print(f"界面流程自检失败 {len(fails)} 项：{fails}")
@@ -4381,7 +5448,7 @@ def uitest() -> int:
 
 
 # =====================================================================
-# 十、命令行
+# 十一、命令行
 # =====================================================================
 
 def cli_probe(args) -> int:
@@ -4436,6 +5503,27 @@ def cli_probe(args) -> int:
                                   for k, v in env.items()}}, ensure_ascii=False, indent=2))
         return 0 if chk["ok"] else 2
 
+    if args.codex_check:
+        base = normalize_base(args.url)
+        chk = check_openai_channel(base, args.key, args.model or "", timeout=args.timeout,
+                                   verify=not args.no_verify, log=log)
+        if args.json:
+            print(json.dumps(chk, ensure_ascii=False, indent=2))
+            return 0 if chk["ok"] else 2
+        print()
+        print(f"结论           : {chk['verdict']}")
+        print(f"Codex base_url : {chk['base_url']}")
+        print(f"wire_api       : {chk['wire_api'] or '-'}")
+        print(f"HTTP 状态      : {chk['status']}")
+        print(f"耗时           : {chk['latency_ms'] or '-'} ms")
+        print(f"返回内容       : {chk['reply'] or '-'}")
+        for t in chk.get("tried", []):
+            print(f"  尝试 {t.get('wire_api'):10} HTTP {t.get('status') or '-'}　{t.get('error') or ''}")
+        print("\n可写进 ~/.codex/config.toml 的 provider 段（Key 不放配置里）：")
+        print(render_codex_provider_block(chk["base_url"] or "<BASE>/v1", "CODEX_API_KEY",
+                                          chk["wire_api"] or "responses", "API Probe"))
+        return 0 if chk["ok"] else 2
+
     res = probe(args.url, args.key, model=args.model or "", timeout=args.timeout,
                 verify=not args.no_verify, deep=not args.no_deep, log=log)
     if args.json:
@@ -4488,6 +5576,8 @@ def main(argv=None) -> int:
                     help="只做第 1 步：拉取模型列表后退出（不做生成测试）")
     ap.add_argument("--claude-check", action="store_true",
                     help="检测网关是否实现 Anthropic Messages 协议（Claude Code 直连的前提）")
+    ap.add_argument("--codex-check", action="store_true",
+                    help="检测网关的 OpenAI 通道（/v1/responses 与 /v1/chat/completions），判断 Codex 的 wire_api")
     ap.add_argument("--selftest", action="store_true", help="运行内置自检")
     ap.add_argument("--uitest", action="store_true", help="运行图形界面构建自检")
     args = ap.parse_args(argv)
