@@ -1,0 +1,12 @@
+# 统一换行符：仓库内一律 LF，但 Windows 批处理检出为 CRLF
+# （cmd 解析 .bat 时，纯 LF 在 goto/标签等场景有已知隐患）
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制文件不要当做文本处理
+*.png binary
+*.jpg binary
+*.ico binary
+*.exe binary
+*.zip binary

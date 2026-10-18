@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller 打包产物（由 打包exe.bat 生成）
+build/
+dist/
+*.spec
+
+# 本地配置兜底
+# 正常运行时的配置在 ~/.api_probe.json（不在本仓库）；
+# 这里再排除一次，防止有人把带 Key 的配置拷进项目目录后误提交。
+.api_probe.json
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini

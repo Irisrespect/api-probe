@@ -1,0 +1,3114 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+API 中转站测活工具 (API Probe)  v1.3.0
+=====================================================================
+单文件、零第三方依赖的 Windows 桌面小工具（Python 3.9+，自带 tkinter 即可运行）
+
+多站点管理
+----------
+    顶部「站点」下拉里可以放任意多个中转站，每个站点各自记住 地址 / Key / 默认模型：
+      ＋ 添加站点   填名称 + 地址（可用常用预设快速填充）+ Key + 默认模型
+      编辑 / 删除   对当前选中的站点操作
+      ✎ 自定义（临时）  内置的一格，不参与站点列表，但同样记住你敲进去的内容
+    切换站点会自动带出该站的地址与 Key；正在编辑的内容会先存回原来那一格，
+    所以「切到 Kimi 再切回自定义」不会丢东西。加完站点还能一键导入批量列表做巡检。
+
+工作流程（两段式，中间由你决定测哪个模型）
+------------------------------------------
+    第 ① 步  选好站点 → 点「获取模型列表」
+              → 探测站点指纹、自动识别协议族（OpenAI / Anthropic / Gemini）
+              → 拉回模型列表填进表格（此步不发任何生成请求）
+    第 ② 步  在列表里挑一个模型（双击直接测，或选中后点按钮）
+              → 发一次最小对话，测首字延迟、比对返回模型、校验 usage
+
+配置持久化（~/.api_probe.json，config_version 3）
+------------------------------------------------
+    * 明文保存：站点列表（名称/地址/默认模型）、超时、各开关、窗口大小
+    * 加密保存：各站点的 Key 与批量列表 —— 仅在勾选「记住 Key」时写入，
+      且用 Windows DPAPI 按当前用户加密（同一台机器的同一个用户才能解开）
+    * 旧版（v1/v2）配置会自动迁移：原来那个地址会变成一个名为「默认站点」的站点
+    * 随时可用「清除已存 Key」抹掉文件中的凭据；取消勾选「记住 Key」也会立即清空
+
+功能
+----
+1. 连通性测试：HTTP 状态、各阶段耗时、错误原文
+2. 协议自动识别：OpenAI 兼容 / Anthropic / Gemini，自动选择端点与鉴权头
+3. 模型列表：表格化展示、过滤、只看主流、复制、导出
+4. 真实生成测试：流式最小对话，测「首字延迟」，验证是否真能出字
+5. 掺水鉴别：请求模型 vs 返回模型比对、异常低延迟、usage 缺失、模型不在列表等信号
+6. 站点指纹：探测 /api/status 与首页 title，识别是否 New API / one-api / Veloera 系面板
+7. 批量测试多站（可一键从站点列表导入）+ 导出 CSV / JSON
+
+用法
+----
+    python api_probe.py                          # 启动图形界面
+    python api_probe.py --url URL --key KEY --list-only          # 只做第 ① 步，列出模型
+    python api_probe.py --url URL --key KEY --model M            # 指定模型直接做第 ② 步
+    python api_probe.py --url URL --key KEY --json               # 一次性两步，JSON 输出
+    python api_probe.py --selftest               # 核心逻辑自检（本地 mock，不访问外网）
+    python api_probe.py --uitest                 # 界面 + 站点管理 + 两段式流程自检
+
+作者说明：本工具只做「客户端主动探测」，不代理、不存储任何请求内容。
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import concurrent.futures
+import gzip
+import json
+import os
+import queue
+import re
+import socket
+import ssl
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import zlib
+from pathlib import Path
+
+APP_NAME = "API 中转站测活工具"
+APP_VERSION = "1.3.0"
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) api-probe/1.0"
+DEFAULT_TIMEOUT = 20.0
+CONFIG_PATH = Path.home() / ".api_probe.json"
+
+# 主流模型（用于「站点都提供哪些主流模型」的命中统计，按归一化名匹配）
+MAINSTREAM_MODELS = [
+    "gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-5", "o3", "o4-mini",
+    "claude-opus-4-1", "claude-sonnet-4-5", "claude-3-5-sonnet", "claude-3-7-sonnet",
+    "gemini-2-5-pro", "gemini-2-5-flash", "gemini-2-0-flash",
+    "deepseek-chat", "deepseek-reasoner", "qwen3", "qwen-max", "glm-4-6", "kimi-k2",
+    "grok-4", "llama-3-3-70b",
+]
+
+# 常见端点后缀，用于把用户粘贴的完整 URL 还原成 base
+KNOWN_SUFFIXES = (
+    "/v1/chat/completions", "/chat/completions",
+    "/v1/completions", "/v1/responses", "/responses",
+    "/v1/messages", "/messages",
+    "/v1/embeddings", "/v1/rerank",
+    "/v1/models", "/models",
+    "/v1beta/models", "/v1beta",
+    "/v1",
+)
+# 注意：不要剥离 "/api/v1" 这类自定义前缀，否则 OpenRouter(https://openrouter.ai/api/v1)
+# 会被错误地还原成 https://openrouter.ai，导致请求打到 /v1/models 而 404。
+
+# 中转站/面板特征串（出现在错误信息或响应体里）
+PANEL_SIGNATURES = [
+    ("new_api_error", "New API"), ("one_api_error", "one-api"),
+    ("newapi", "New API"), ("veloera", "Veloera"),
+    ("无可用渠道", "New API/one-api 系（无可用渠道）"),
+    ("当前分组上游负载已饱和", "New API/one-api 系（分组负载饱和）"),
+    ("渠道", "New API/one-api 系"),
+    ("令牌", "New API/one-api 系"),
+]
+
+VENDOR_PREFIXES = {
+    "openai", "anthropic", "google", "meta-llama", "deepseek", "qwen", "x-ai",
+    "mistralai", "moonshotai", "z-ai", "minimax", "cohere", "amazon", "microsoft",
+    "nvidia", "perplexity", "ai21", "thudm", "01-ai",
+}
+
+DATE_SUFFIX_RE = re.compile(r"-(?:20\d{2}-\d{2}-\d{2}|20\d{6}|\d{6})$")
+
+
+# =====================================================================
+# 一、通用小工具
+# =====================================================================
+
+def now_ms(t0: float) -> float:
+    return round((time.perf_counter() - t0) * 1000, 1)
+
+
+def get_header(headers: dict, name: str, default: str = "") -> str:
+    if not headers:
+        return default
+    lname = name.lower()
+    for k, v in headers.items():
+        if k.lower() == lname:
+            return v or default
+    return default
+
+
+def decode_body(raw: bytes, headers: dict | None = None) -> str:
+    if not raw:
+        return ""
+    enc = get_header(headers or {}, "Content-Encoding").lower()
+    try:
+        if "gzip" in enc:
+            raw = gzip.decompress(raw)
+        elif "deflate" in enc:
+            raw = zlib.decompress(raw)
+    except Exception:
+        pass
+    for cs in ("utf-8", "gb18030", "latin-1"):
+        try:
+            return raw.decode(cs)
+        except Exception:
+            continue
+    return raw.decode("utf-8", "replace")
+
+
+def safe_json(text: str):
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    # 有些站点在 JSON 前后夹了多余内容，尝试截取首个 { 到末个 }
+    s = text.find("{")
+    e = text.rfind("}")
+    if 0 <= s < e:
+        try:
+            return json.loads(text[s:e + 1])
+        except Exception:
+            return None
+    return None
+
+
+def mask_key(key: str) -> str:
+    if not key:
+        return "(空)"
+    if len(key) <= 10:
+        return key[:3] + "***"
+    return f"{key[:6]}...{key[-4:]} (len={len(key)})"
+
+
+# --------------------------- 本机凭据加密（Windows DPAPI） ---------------------------
+# 用当前 Windows 用户的凭据加解密，密钥由系统托管：同一台机器的同一个用户才能解开。
+# 非 Windows 或调用失败时返回 None，调用方回退为明文并在配置里标记「未加密」。
+
+def dpapi_crypt(data: bytes, encrypt: bool) -> bytes | None:
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class DATA_BLOB(ctypes.Structure):
+            _fields_ = [("cbData", wintypes.DWORD),
+                        ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
+
+        crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        buf = (ctypes.c_ubyte * len(data)).from_buffer_copy(data)
+        blob_in = DATA_BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_ubyte)))
+        blob_out = DATA_BLOB()
+        if encrypt:
+            ok = crypt32.CryptProtectData(ctypes.byref(blob_in), None, None, None, None, 0,
+                                          ctypes.byref(blob_out))
+        else:
+            ok = crypt32.CryptUnprotectData(ctypes.byref(blob_in), None, None, None, None, 0,
+                                            ctypes.byref(blob_out))
+        if not ok:
+            return None
+        try:
+            return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+        finally:
+            kernel32.LocalFree(blob_out.pbData)
+    except Exception:
+        return None
+
+
+def dpapi_available() -> bool:
+    return dpapi_crypt(b"probe", True) is not None
+
+
+def encode_secret(text: str) -> tuple[str, bool]:
+    """把敏感文本变成「可写进配置文件的字符串」。返回 (内容, 是否已加密)。"""
+    if not text:
+        return "", True
+    blob = dpapi_crypt(text.encode("utf-8"), True)
+    if blob is None:
+        return text, False
+    return base64.b64encode(blob).decode("ascii"), True
+
+
+def decode_secret(value: str, encrypted: bool) -> str:
+    if not value:
+        return ""
+    if not encrypted:
+        return value
+    try:
+        raw = base64.b64decode(value.encode("ascii"), validate=False)
+    except Exception:
+        return ""
+    plain = dpapi_crypt(raw, False)
+    return plain.decode("utf-8", "replace") if plain is not None else ""
+
+
+def ssl_context(verify: bool) -> ssl.SSLContext:
+    ctx = ssl.create_default_context()
+    if not verify:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def normalize_base(url: str) -> str:
+    """把用户输入的各种写法归一化为 base（不含 /v1 等端点后缀）。"""
+    u = (url or "").strip().strip('"').strip("'").strip()
+    if not u:
+        return ""
+    u = u.split("#")[0]
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", u):
+        u = "https://" + u
+    u = u.split("?")[0].rstrip("/")
+    changed = True
+    while changed:
+        changed = False
+        low = u.lower()
+        for suf in KNOWN_SUFFIXES:
+            if low.endswith(suf) and len(u) > len(suf) + 8:
+                u = u[: -len(suf)].rstrip("/")
+                changed = True
+                break
+    return u
+
+
+def norm_model(name: str) -> str:
+    """归一化模型名，用于「请求 vs 返回」比对：去厂商前缀、去日期后缀、统一分隔符。"""
+    s = (name or "").strip().lower()
+    if s.startswith("models/"):
+        s = s[len("models/"):]
+    if "/" in s:
+        head, _, tail = s.partition("/")
+        if head in VENDOR_PREFIXES and tail:
+            s = tail
+    s = s.split(":")[0]
+    s = s.replace(".", "-").replace("_", "-")
+    s = re.sub(r"-+", "-", s)
+    s = DATE_SUFFIX_RE.sub("", s)
+    s = re.sub(r"-latest$", "", s)
+    return s
+
+
+def extract_error_message(text: str, code: int | None = None) -> str:
+    """从错误响应体里挖出人能看懂的一句话。"""
+    t = (text or "").strip()
+    if not t:
+        return f"HTTP {code}（空响应体）" if code else "空响应"
+    obj = safe_json(t)
+    if isinstance(obj, dict):
+        msg = None
+        for key in ("error", "message", "msg", "detail", "error_msg", "reason"):
+            v = obj.get(key)
+            if isinstance(v, str) and v.strip():
+                msg = v.strip()
+                break
+            if isinstance(v, dict):
+                for k2 in ("message", "msg", "detail", "type"):
+                    v2 = v.get(k2)
+                    if isinstance(v2, str) and v2.strip():
+                        msg = v2.strip()
+                        break
+                if msg:
+                    break
+        if not msg and isinstance(obj.get("errors"), list) and obj["errors"]:
+            first = obj["errors"][0]
+            if isinstance(first, dict):
+                msg = str(first.get("message") or first)
+            else:
+                msg = str(first)
+        if msg:
+            etype = ""
+            err = obj.get("error")
+            if isinstance(err, dict) and isinstance(err.get("type"), str):
+                etype = err["type"]
+            elif isinstance(obj.get("type"), str) and obj.get("type") != "error":
+                etype = obj["type"]
+            return f"{msg}" + (f"  [{etype}]" if etype and etype not in msg else "")
+    return t[:400]
+
+
+def detect_panel_hint(text: str) -> str:
+    low = (text or "").lower()
+    for sig, label in PANEL_SIGNATURES:
+        if sig in low or sig in (text or ""):
+            return label
+    return ""
+
+
+# =====================================================================
+# 二、HTTP 核心（GET / POST / 流式 SSE）
+# =====================================================================
+
+class HttpResult:
+    __slots__ = ("ok", "status", "reason", "headers", "text", "latency_ms", "error", "url")
+
+    def __init__(self, ok, status, reason, headers, text, latency_ms, error, url):
+        self.ok = ok
+        self.status = status
+        self.reason = reason
+        self.headers = headers or {}
+        self.text = text or ""
+        self.latency_ms = latency_ms
+        self.error = error or ""
+        self.url = url
+
+    @property
+    def json(self):
+        return safe_json(self.text)
+
+    def __repr__(self):
+        return f"<HttpResult {self.status} {self.latency_ms}ms ok={self.ok} err={self.error[:60]!r}>"
+
+
+def http_request(method: str, url: str, headers: dict | None = None, payload=None,
+                 timeout: float = DEFAULT_TIMEOUT, verify: bool = True,
+                 read_limit: int = 4_000_000) -> HttpResult:
+    hdrs = {k: v for k, v in (headers or {}).items() if v is not None}
+    hdrs.setdefault("User-Agent", UA)
+    hdrs.setdefault("Accept", "application/json")
+    data = None
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        hdrs.setdefault("Content-Type", "application/json")
+    req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
+    ctx = ssl_context(verify) if url.lower().startswith("https") else None
+    t0 = time.perf_counter()
+    try:
+        resp = urllib.request.urlopen(req, timeout=timeout, context=ctx)
+    except urllib.error.HTTPError as e:
+        raw = b""
+        try:
+            raw = e.read(read_limit)
+        except Exception:
+            pass
+        return HttpResult(False, e.code, str(e.reason), dict(e.headers or {}),
+                          decode_body(raw, dict(e.headers or {})), now_ms(t0), "", url)
+    except urllib.error.URLError as e:
+        reason = getattr(e, "reason", e)
+        return HttpResult(False, 0, "", {}, "", now_ms(t0), f"网络错误: {reason}", url)
+    except (socket.timeout, TimeoutError):
+        return HttpResult(False, 0, "", {}, "", now_ms(t0), f"超时（>{timeout:g}s）", url)
+    except Exception as e:  # noqa: BLE001
+        return HttpResult(False, 0, "", {}, "", now_ms(t0), f"{type(e).__name__}: {e}", url)
+    with resp:
+        try:
+            raw = resp.read(read_limit)
+        except (socket.timeout, TimeoutError):
+            return HttpResult(False, resp.status, "", dict(resp.headers or {}), "",
+                              now_ms(t0), "读取响应超时", url)
+        except Exception as e:  # noqa: BLE001
+            return HttpResult(False, resp.status, "", dict(resp.headers or {}), "",
+                              now_ms(t0), f"读取失败: {e}", url)
+        return HttpResult(True, resp.status, str(resp.reason), dict(resp.headers or {}),
+                          decode_body(raw, dict(resp.headers or {})), now_ms(t0), "", url)
+
+
+class SseCollector:
+    """收集一次流式生成的关键指标。"""
+
+    def __init__(self):
+        self.status = 0
+        self.first_ms: float | None = None
+        self.total_ms: float | None = None
+        self.model: str = ""
+        self.text: str = ""
+        self.usage = None
+        self.error: str = ""
+        self.chunks = 0
+        self.done = False
+        self.timed_out = False
+
+
+def stream_generate(url: str, headers: dict, payload: dict, feeder, timeout: float,
+                    verify: bool, stop_event: threading.Event | None = None,
+                    max_text: int = 64) -> SseCollector:
+    """发一次流式请求，用 feeder 解析 SSE，返回 SseCollector。"""
+    col = SseCollector()
+    hdrs = {k: v for k, v in (headers or {}).items() if v is not None}
+    hdrs.setdefault("User-Agent", UA)
+    hdrs["Accept"] = "text/event-stream"
+    hdrs["Content-Type"] = "application/json"
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
+    ctx = ssl_context(verify) if url.lower().startswith("https") else None
+    t0 = time.perf_counter()
+    try:
+        resp = urllib.request.urlopen(req, timeout=timeout, context=ctx)
+    except urllib.error.HTTPError as e:
+        raw = b""
+        try:
+            raw = e.read(200_000)
+        except Exception:
+            pass
+        col.status = e.code
+        col.error = extract_error_message(decode_body(raw, dict(e.headers or {})), e.code)
+        col.total_ms = now_ms(t0)
+        return col
+    except urllib.error.URLError as e:
+        col.error = f"网络错误: {getattr(e, 'reason', e)}"
+        col.total_ms = now_ms(t0)
+        return col
+    except (socket.timeout, TimeoutError):
+        col.error = f"超时（>{timeout:g}s）"
+        col.total_ms = now_ms(t0)
+        return col
+    except Exception as e:  # noqa: BLE001
+        col.error = f"{type(e).__name__}: {e}"
+        col.total_ms = now_ms(t0)
+        return col
+
+    col.status = resp.status
+    event = ""
+    try:
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                col.error = "已手动停止"
+                break
+            if time.perf_counter() - t0 > timeout:
+                col.timed_out = True
+                break
+            try:
+                line = resp.readline()
+            except (socket.timeout, TimeoutError):
+                col.timed_out = True
+                break
+            except Exception as e:  # noqa: BLE001
+                col.error = f"读取流失败: {e}"
+                break
+            if not line:
+                break
+            text = line.decode("utf-8", "replace").rstrip("\r\n")
+            if not text:
+                event = ""
+                continue
+            if text.startswith(":"):
+                continue
+            if text.startswith("event:"):
+                event = text[6:].strip()
+                continue
+            if not text.startswith("data:"):
+                continue
+            chunk = text[5:].strip()
+            if chunk == "[DONE]":
+                col.done = True
+                break
+            obj = safe_json(chunk)
+            if not isinstance(obj, (dict, list)):
+                continue
+            col.chunks += 1
+            feeder(col, event, obj, t0)
+            if col.done or len(col.text) >= max_text or col.error:
+                break
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+    col.total_ms = now_ms(t0)
+    return col
+
+
+# --------------------------- SSE 解析器 ---------------------------
+
+def feed_openai(col: SseCollector, event: str, obj, t0: float) -> None:
+    if isinstance(obj, dict):
+        if isinstance(obj.get("error"), (dict, str)) and not obj.get("choices"):
+            col.error = extract_error_message(json.dumps(obj), None)
+            col.done = True
+            return
+        if not col.model and isinstance(obj.get("model"), str):
+            col.model = obj["model"]
+        if isinstance(obj.get("usage"), dict):
+            col.usage = obj["usage"]
+        for ch in obj.get("choices") or []:
+            if not isinstance(ch, dict):
+                continue
+            delta = ch.get("delta") or ch.get("message") or {}
+            if isinstance(delta, dict):
+                piece = delta.get("content") or delta.get("reasoning_content") or ""
+                if isinstance(piece, str) and piece:
+                    if col.first_ms is None:
+                        col.first_ms = now_ms(t0)
+                    col.text += piece
+
+
+def feed_anthropic(col: SseCollector, event: str, obj, t0: float) -> None:
+    if not isinstance(obj, dict):
+        return
+    etype = obj.get("type") or event
+    if etype == "error" or (isinstance(obj.get("error"), dict) and obj["error"]):
+        col.error = extract_error_message(json.dumps(obj), None)
+        col.done = True
+        return
+    if etype == "message_start":
+        msg = obj.get("message") or {}
+        if isinstance(msg, dict):
+            if isinstance(msg.get("model"), str):
+                col.model = msg["model"]
+            if isinstance(msg.get("usage"), dict):
+                col.usage = msg["usage"]
+    elif etype == "content_block_delta":
+        delta = obj.get("delta") or {}
+        piece = delta.get("text") or delta.get("partial_json") or ""
+        if isinstance(piece, str) and piece:
+            if col.first_ms is None:
+                col.first_ms = now_ms(t0)
+            col.text += piece
+    elif etype == "message_delta":
+        if isinstance(obj.get("usage"), dict):
+            col.usage = obj["usage"]
+
+
+def feed_gemini(col: SseCollector, event: str, obj, t0: float) -> None:
+    if not isinstance(obj, dict):
+        return
+    if isinstance(obj.get("error"), dict):
+        col.error = extract_error_message(json.dumps(obj), None)
+        col.done = True
+        return
+    if not col.model and isinstance(obj.get("modelVersion"), str):
+        col.model = obj["modelVersion"]
+    if isinstance(obj.get("usageMetadata"), dict):
+        col.usage = obj["usageMetadata"]
+    for cand in obj.get("candidates") or []:
+        if not isinstance(cand, dict):
+            continue
+        content = cand.get("content") or {}
+        for part in (content.get("parts") or []) if isinstance(content, dict) else []:
+            piece = part.get("text") if isinstance(part, dict) else None
+            if isinstance(piece, str) and piece:
+                if col.first_ms is None:
+                    col.first_ms = now_ms(t0)
+                col.text += piece
+
+
+# =====================================================================
+# 三、协议适配
+# =====================================================================
+
+def gemini_models_url(base: str) -> list[str]:
+    return [f"{base}/v1beta/models", f"{base}/v1/models"]
+
+
+def parse_models_openai(obj) -> list[dict]:
+    out: list[dict] = []
+    if not isinstance(obj, dict):
+        return out
+    data = obj.get("data")
+    if isinstance(data, dict):
+        data = data.get("models") or data.get("data") or data.get("list") or []
+    if isinstance(data, list):
+        for it in data:
+            if isinstance(it, str):
+                out.append({"id": it, "owner": ""})
+            elif isinstance(it, dict):
+                mid = it.get("id") or it.get("model") or it.get("name") or it.get("model_name")
+                if mid:
+                    out.append({
+                        "id": str(mid),
+                        "owner": str(it.get("owned_by") or it.get("owner") or it.get("provider") or ""),
+                    })
+    if not out:
+        for key in ("models", "model", "result"):
+            arr = obj.get(key)
+            if isinstance(arr, list):
+                for it in arr:
+                    if isinstance(it, str):
+                        out.append({"id": it, "owner": ""})
+                    elif isinstance(it, dict):
+                        mid = it.get("id") or it.get("model") or it.get("name")
+                        if mid:
+                            out.append({"id": str(mid), "owner": str(it.get("owned_by") or "")})
+                if out:
+                    break
+    # 去重保序
+    seen, uniq = set(), []
+    for m in out:
+        if m["id"] not in seen:
+            seen.add(m["id"])
+            uniq.append(m)
+    return uniq
+
+
+def parse_models_gemini(obj) -> list[dict]:
+    out: list[dict] = []
+    if not isinstance(obj, dict):
+        return out
+    for it in obj.get("models") or []:
+        if isinstance(it, dict):
+            name = str(it.get("name") or it.get("id") or "")
+            if name:
+                out.append({
+                    "id": name.split("/")[-1],
+                    "owner": "google",
+                    "display": str(it.get("displayName") or ""),
+                })
+        elif isinstance(it, str):
+            out.append({"id": it.split("/")[-1], "owner": "google"})
+    return out
+
+
+PROTOCOLS = {
+    "openai": {
+        "label": "OpenAI 兼容",
+        "models_probes": [
+            ("Bearer", lambda base: f"{base}/v1/models"),
+            ("Bearer", lambda base: f"{base}/models"),
+        ],
+        "parse_models": parse_models_openai,
+        "feed": feed_openai,
+    },
+    "anthropic": {
+        "label": "Anthropic",
+        "models_probes": [
+            ("x-api-key", lambda base: f"{base}/v1/models"),
+        ],
+        "parse_models": parse_models_openai,
+        "feed": feed_anthropic,
+    },
+    "gemini": {
+        "label": "Gemini",
+        "models_probes": [
+            ("x-goog-api-key", lambda base: f"{base}/v1beta/models"),
+            ("x-goog-api-key", lambda base: f"{base}/v1/models"),
+        ],
+        "parse_models": parse_models_gemini,
+        "feed": feed_gemini,
+    },
+}
+
+
+def auth_headers(protocol: str, key: str, scheme: str) -> dict:
+    if not key:
+        return {}
+    if scheme == "Bearer":
+        return {"Authorization": f"Bearer {key}"}
+    if scheme == "x-api-key":
+        return {"x-api-key": key, "anthropic-version": "2023-06-01"}
+    if scheme == "x-goog-api-key":
+        return {"x-goog-api-key": key}
+    return {}
+
+
+def generation_request(protocol: str, base: str, key: str, model: str, stream: bool):
+    """返回 (url, headers, payload) 或 (None, error)。"""
+    prompt = "Say OK"
+    if protocol == "openai":
+        return (f"{base}/v1/chat/completions",
+                {"Authorization": f"Bearer {key}"} if key else {},
+                {"model": model, "messages": [{"role": "user", "content": prompt}],
+                 "max_tokens": 8, "stream": stream})
+    if protocol == "anthropic":
+        hdrs = {"anthropic-version": "2023-06-01"}
+        if key:
+            hdrs["x-api-key"] = key
+        return (f"{base}/v1/messages", hdrs,
+                {"model": model, "max_tokens": 8,
+                 "messages": [{"role": "user", "content": prompt}], "stream": stream})
+    if protocol == "gemini":
+        path = "streamGenerateContent?alt=sse" if stream else "generateContent"
+        url = f"{base}/v1beta/models/{urllib.parse.quote(model)}:{path}"
+        hdrs = {"x-goog-api-key": key} if key else {}
+        return (url, hdrs,
+                {"contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                 "generationConfig": {"maxOutputTokens": 8}})
+    return (None, "未知协议")
+
+
+def parse_nonstream_model_usage(protocol: str, obj) -> tuple[str, object]:
+    """从非流式响应里取 (返回模型, usage)。"""
+    if not isinstance(obj, dict):
+        return "", None
+    if protocol == "gemini":
+        return str(obj.get("modelVersion") or ""), obj.get("usageMetadata")
+    if protocol == "anthropic":
+        return str(obj.get("model") or ""), obj.get("usage")
+    return str(obj.get("model") or ""), obj.get("usage")
+
+
+# =====================================================================
+# 四、站点指纹
+# =====================================================================
+
+def probe_fingerprint(base: str, timeout: float, verify: bool, log=None) -> dict:
+    info = {"panel": "", "system_name": "", "version": "", "title": "", "detail": {}}
+    r = http_request("GET", f"{base}/api/status", timeout=min(timeout, 12), verify=verify,
+                     read_limit=200_000)
+    if log:
+        log(f"  [指纹] GET {base}/api/status -> {r.status or r.error} {r.latency_ms}ms")
+    if r.ok and isinstance(r.json, dict):
+        d = r.json.get("data") if isinstance(r.json.get("data"), dict) else r.json
+        if isinstance(d, dict):
+            ver = str(d.get("version") or d.get("Version") or "")
+            name = str(d.get("system_name") or d.get("systemName") or d.get("name") or "")
+            if ver or name:
+                info["version"], info["system_name"] = ver, name
+                info["detail"] = {k: d.get(k) for k in
+                                  ("version", "system_name", "quota_per_unit", "display_in_currency",
+                                   "enable_online_topup", "enable_online_topup_pay_method",
+                                   "price", "footer_html", "chat_link", "docs_link", "start_time")
+                                  if k in d}
+                if any(k in d for k in ("quota_per_unit", "display_in_currency", "enable_online_topup")):
+                    info["panel"] = "New API（含在线支付/额度字段）"
+                else:
+                    info["panel"] = "one-api / 衍生面板"
+    if not info["panel"]:
+        root = http_request("GET", base + "/", timeout=min(timeout, 12), verify=verify,
+                            read_limit=200_000)
+        if log:
+            log(f"  [指纹] GET {base}/ -> {root.status or root.error} {root.latency_ms}ms")
+        m = re.search(r"<title[^>]*>(.*?)</title>", root.text or "", re.I | re.S)
+        if m:
+            info["title"] = re.sub(r"\s+", " ", m.group(1)).strip()[:80]
+        blob = (root.text or "")[:4000]
+        hint = detect_panel_hint(blob)
+        if hint:
+            info["panel"] = hint
+        elif "new-api" in blob.lower() or "new api" in blob.lower():
+            info["panel"] = "New API（首页特征）"
+    return info
+
+
+# =====================================================================
+# 五、主探测流程
+# =====================================================================
+
+MAINSTREAM_ORDER = {name: idx for idx, name in enumerate(MAINSTREAM_MODELS)}
+
+# 明显不适合做对话测试的模型（向量/语音/图像/审核）
+NON_CHAT_MARKERS = ("embed", "rerank", "tts", "whisper", "audio", "speech", "moderation",
+                    "dall-e", "image", "sora", "veo", "flux", "stable-diffusion",
+                    "vision-encoder", "codex-mini-latest", "computer-use")
+# 变体后缀：batch/free/extended 这类通常不能直接拿来做普通对话
+VARIANT_MARKERS = (":batch", ":free", ":extended", ":online", ":thinking", ":nitro",
+                   ":floor", "-preview", "-beta", "-exp", "-search", "-online", "-thinking")
+
+
+def choose_default_model(models: list[dict], requested: str = "") -> str:
+    """挑一个最适合做「最小生成测试」的模型。"""
+    ids = [m.get("id") for m in models if m.get("id")]
+    if not ids:
+        return requested or ""
+    if requested:
+        if requested in ids:
+            return requested
+        by_norm = {}
+        for i in ids:
+            by_norm.setdefault(norm_model(i), i)
+        return by_norm.get(norm_model(requested), requested)
+
+    scored: list[tuple[float, str]] = []
+    for i in ids:
+        low = i.lower()
+        if any(b in low for b in NON_CHAT_MARKERS):
+            continue
+        nm = norm_model(i)
+        score = 0.0
+        if nm in MAINSTREAM_ORDER:
+            score += 1000 - MAINSTREAM_ORDER[nm] * 5      # 主流优先，名单越靠前越优先
+        if any(v in low for v in VARIANT_MARKERS):
+            score -= 300                                  # batch/free 之类靠后
+        if ":" not in i:
+            score += 20                                   # 无变体后缀的更可能是标准入口
+        score -= len(i) * 0.1                             # 名字短的更干净
+        scored.append((score, i))
+    if not scored:
+        scored = [(0.0, i) for i in ids]
+    scored.sort(key=lambda x: (-x[0], len(x[1]), x[1]))
+    return scored[0][1]
+
+
+def probe_site(base_input: str, key: str, timeout: float = DEFAULT_TIMEOUT,
+               verify: bool = True, log=None,
+               stop_event: threading.Event | None = None) -> dict:
+    """【第 1 步】站点指纹 + 协议识别 + 拉取模型列表。
+
+    只做「读」操作，不发任何生成请求，拿到列表交给人工挑模型。
+    """
+    def L(msg):
+        if log:
+            log(msg)
+
+    res = {
+        "input": base_input, "base": "", "protocol": "", "protocol_label": "",
+        "models": [], "models_ms": None, "models_status": None, "models_error": "",
+        "fingerprint": "", "fingerprint_detail": {},
+        "requested_model": "", "used_model": "", "returned_model": "",
+        "first_token_ms": None, "gen_ms": None, "stream_ok": False, "gen_error": "",
+        "usage": None, "sample_text": "", "http_status": None, "attempts": [],
+        "warnings": [], "gen_warnings": [], "auth_error": "",
+        "verdict": "", "verdict_level": "error", "ok": False, "ok_site": False,
+    }
+    base = normalize_base(base_input)
+    res["base"] = base
+    if not base:
+        res["verdict"] = "地址为空或格式不正确"
+        return res
+
+    L(f"[1/2] 站点指纹探测: {base}")
+    fp = probe_fingerprint(base, timeout, verify, log=L)
+    res["fingerprint"] = fp.get("panel") or fp.get("title") or ""
+    res["fingerprint_detail"] = fp
+    if fp.get("system_name"):
+        res["fingerprint"] = f"{fp['panel']} · {fp['system_name']} {fp.get('version','')}".strip()
+
+    # ---- 协议识别 ----
+    L(f"[2/2] 识别协议族并拉取模型列表: {base}")
+    order = ["openai", "gemini", "anthropic"]
+    low_base = base.lower()
+    if "generativelanguage" in low_base or "googleapis" in low_base:
+        order = ["gemini", "openai", "anthropic"]
+    elif key.startswith("sk-ant") or "anthropic" in low_base:
+        order = ["anthropic", "openai", "gemini"]
+
+    auth_fail_msg = ""
+    for proto in order:
+        spec = PROTOCOLS[proto]
+        for scheme, urlf in spec["models_probes"]:
+            url = urlf(base)
+            for extra_q in ([{}] if scheme != "x-goog-api-key" else [{}, {"key": key}]):
+                u = url if not extra_q else f"{url}?key={urllib.parse.quote(key)}"
+                hdrs = auth_headers(proto, key, scheme)
+                r = http_request("GET", u, headers=hdrs, timeout=timeout, verify=verify)
+                attempt = {"protocol": proto, "url": u, "status": r.status,
+                           "ms": r.latency_ms, "error": r.error}
+                L(f"  [{spec['label']}] GET {u} -> {r.status or r.error} {r.latency_ms}ms")
+                if r.ok:
+                    models = spec["parse_models"](r.json)
+                    if models or isinstance(r.json, (dict, list)):
+                        res["protocol"] = proto
+                        res["protocol_label"] = spec["label"]
+                        res["models"] = models
+                        res["models_ms"] = r.latency_ms
+                        res["models_status"] = r.status
+                        res["http_status"] = r.status
+                        attempt["models"] = len(models)
+                        res["attempts"].append(attempt)
+                        break
+                    attempt["error"] = "响应不是可解析的模型列表"
+                else:
+                    attempt["error"] = r.error or extract_error_message(r.text, r.status)
+                    if r.status in (401, 403):
+                        auth_fail_msg = attempt["error"]
+                        hint = detect_panel_hint(r.text)
+                        if hint and not res["fingerprint"]:
+                            res["fingerprint"] = hint
+                res["attempts"].append(attempt)
+            if res["protocol"]:
+                break
+        if res["protocol"]:
+            break
+
+    if not res["protocol"]:
+        # 模型端点全挂：仍按 OpenAI 兼容处理，让用户手工输入模型名再测
+        L("  /v1/models 全部不可用；仍按 OpenAI 兼容处理，可手工输入模型名再测试")
+        res["protocol"] = "openai"
+        res["protocol_label"] = "OpenAI 兼容（推测）"
+        res["models_error"] = auth_fail_msg or "所有模型列表端点均失败"
+
+    res["model_count"] = len(res["models"])
+    L(f"  -> 协议={res['protocol_label']} 模型数={res['model_count']}")
+    if stop_event is not None and stop_event.is_set():
+        res["verdict"] = "已手动停止"
+        return res
+    _finalize_site(res)
+    return res
+
+
+def probe_generate(res: dict, key: str, model: str, timeout: float = DEFAULT_TIMEOUT,
+                   verify: bool = True, deep: bool = True, log=None,
+                   stop_event: threading.Event | None = None) -> dict:
+    """【第 2 步】用人工选定的模型发一次最小生成请求：测首字延迟 + 掺水/降级鉴别。
+
+    就地更新并返回第 1 步的 res（可以反复换模型重测，不会累积旧结论）。
+    """
+    def L(msg):
+        if log:
+            log(msg)
+
+    base = res.get("base") or ""
+    used = (model or "").strip() or choose_default_model(res.get("models") or [])
+    res["requested_model"] = (model or "").strip()
+    res["used_model"] = used
+    res["returned_model"] = ""
+    res["first_token_ms"] = None
+    res["gen_ms"] = None
+    res["stream_ok"] = False
+    res["gen_error"] = ""
+    res["usage"] = None
+    res["sample_text"] = ""
+    res["gen_warnings"] = []
+    res["ok"] = False
+    if stop_event is not None and stop_event.is_set():
+        res["verdict"] = "已手动停止"
+        return res
+    if not base or not used:
+        res["verdict"] = "缺少地址或模型，无法做生成测试"
+        res["verdict_level"] = "warn"
+        return res
+
+    L(f"[1/2] 生成测试（流式）: 协议={res.get('protocol_label')} 请求模型 = {used}")
+    url, hdrs, payload = generation_request(res["protocol"], base, key, used, stream=True)
+    col = stream_generate(url, hdrs, payload, PROTOCOLS[res["protocol"]]["feed"],
+                          timeout=timeout, verify=verify, stop_event=stop_event)
+    res["gen_ms"] = col.total_ms
+    res["http_status"] = col.status or res["http_status"]
+    attempted_alt = False
+    if col.error and re.search(r"max_tokens|max_completion_tokens|unsupported parameter",
+                               col.error, re.I) and res["protocol"] == "openai":
+        attempted_alt = True
+        payload2 = dict(payload)
+        payload2.pop("max_tokens", None)
+        payload2["max_completion_tokens"] = 8
+        L("  该模型不接受 max_tokens，改用 max_completion_tokens 重试")
+        col = stream_generate(url, hdrs, payload2, feed_openai, timeout=timeout,
+                              verify=verify, stop_event=stop_event)
+        res["gen_ms"] = col.total_ms
+    if col.first_ms is not None:
+        res["first_token_ms"] = col.first_ms
+        res["stream_ok"] = True
+    res["returned_model"] = col.model
+    res["sample_text"] = col.text[:120]
+    if col.usage:
+        res["usage"] = col.usage
+    if col.error:
+        res["gen_error"] = col.error
+
+    # 流式失败 -> 非流式重试（部分站点/模型不支持 stream；但 401/403 是定论，不必重试）
+    if not res["stream_ok"] and col.status not in (401, 403) and \
+            not (stop_event is not None and stop_event.is_set()):
+        L("  流式未拿到内容，改用非流式重试一次")
+        url2, hdrs2, payload2 = generation_request(res["protocol"], base, key, used, stream=False)
+        r2 = http_request("POST", url2, headers=hdrs2, payload=payload2, timeout=timeout,
+                          verify=verify)
+        res["http_status"] = r2.status or res["http_status"]
+        L(f"  POST {url2} -> {r2.status or r2.error} {r2.latency_ms}ms")
+        if r2.ok:
+            obj = r2.json
+            rm, usage = parse_nonstream_model_usage(res["protocol"], obj)
+            if rm:
+                res["returned_model"] = res["returned_model"] or rm
+            if usage:
+                res["usage"] = usage
+            text = ""
+            if isinstance(obj, dict):
+                if res["protocol"] == "openai":
+                    chs = obj.get("choices") or []
+                    if chs and isinstance(chs[0], dict):
+                        text = str((chs[0].get("message") or {}).get("content") or "")
+                elif res["protocol"] == "gemini":
+                    for c in obj.get("candidates") or []:
+                        for p in ((c.get("content") or {}).get("parts") or []):
+                            text += str(p.get("text") or "")
+                elif res["protocol"] == "anthropic":
+                    for c in obj.get("content") or []:
+                        if isinstance(c, dict) and c.get("type") == "text":
+                            text += str(c.get("text") or "")
+            if text:
+                res["stream_ok"] = True
+                res["sample_text"] = res["sample_text"] or text[:120]
+                res["gen_warnings"].append(("info", "该站/该模型不支持流式输出，非流式可用"))
+            elif not res["gen_error"]:
+                res["gen_error"] = "响应成功但内容为空"
+        else:
+            res["gen_error"] = extract_error_message(r2.text, r2.status) or r2.error
+
+    # 深度检测：补一次非流式拿 usage（校验计费统计是否真实）
+    if deep and res["stream_ok"] and not res["usage"] and \
+            not (stop_event is not None and stop_event.is_set()):
+        u3, h3, p3 = generation_request(res["protocol"], base, key, used, stream=False)
+        if res["protocol"] == "openai":
+            p3["max_tokens"] = 1
+        r3 = http_request("POST", u3, headers=h3, payload=p3, timeout=timeout, verify=verify)
+        L(f"[2/2] 深度检测（非流式取 usage）: POST {u3} -> {r3.status or r3.error} {r3.latency_ms}ms")
+        if r3.ok:
+            rm, usage = parse_nonstream_model_usage(res["protocol"], r3.json)
+            if rm and not res["returned_model"]:
+                res["returned_model"] = rm
+            if usage:
+                res["usage"] = usage
+
+    _finalize_generation(res, attempted_alt)
+    return res
+
+
+def probe(base_input: str, key: str, model: str = "", timeout: float = DEFAULT_TIMEOUT,
+          verify: bool = True, deep: bool = True, log=None,
+          stop_event: threading.Event | None = None) -> dict:
+    """一步到位版本（批量测试 / 命令行用）：拉列表 → 自动或按指定挑模型 → 生成测试。
+
+    图形界面走的是 probe_site + probe_generate 两段式，中间留给人工挑模型。
+    """
+    res = probe_site(base_input, key, timeout=timeout, verify=verify, log=log,
+                     stop_event=stop_event)
+    if not res.get("base") or (stop_event is not None and stop_event.is_set()):
+        return res
+    return probe_generate(res, key, model or "", timeout=timeout, verify=verify, deep=deep,
+                          log=log, stop_event=stop_event)
+
+
+def _finalize_site(res: dict) -> None:
+    """第 1 步的结论：站点是否可达、协议族、模型列表、指纹。"""
+    w = res.setdefault("warnings", [])
+    w.clear()
+    models = res.get("models") or []
+    auth_err = ""
+    for a in res.get("attempts") or []:
+        if a.get("status") in (401, 403):
+            auth_err = a.get("error") or f"HTTP {a['status']}"
+            break
+    res["auth_error"] = auth_err
+
+    if models:
+        res["ok_site"] = True
+        w.append(("ok", f"取到 {len(models)} 个模型（{res.get('models_ms')} ms）"))
+    elif res.get("protocol"):
+        w.append(("warn", res.get("models_error") or "未取到模型列表（部分站点禁用了 /v1/models）"))
+    if res.get("fingerprint"):
+        w.append(("info", f"站点指纹：{res['fingerprint']}"))
+    if models:
+        fams = []
+        for fam, keys in (("OpenAI", ("gpt", "o1", "o3", "o4")),
+                          ("Anthropic", ("claude",)),
+                          ("Google", ("gemini",)),
+                          ("DeepSeek", ("deepseek",)),
+                          ("Qwen", ("qwen",)),
+                          ("GLM", ("glm",)),
+                          ("Kimi", ("kimi", "moonshot"))):
+            if any(any(k in m["id"].lower() for k in keys) for m in models):
+                fams.append(fam)
+        if len(fams) >= 3:
+            w.append(("info", f"聚合站：模型列表覆盖 {'/'.join(fams)} 等多家厂商"))
+    if auth_err:
+        w.append(("error", f"接口鉴权报错：{auth_err}"))
+
+    if res["ok_site"]:
+        res["verdict"] = (f"第 1 步完成：{res.get('protocol_label')}，共 {len(models)} 个模型"
+                          "　→ 请在「模型列表」中挑一个模型，再做第 2 步生成测试")
+        res["verdict_level"] = "ok"
+    elif auth_err:
+        res["verdict"] = f"第 1 步失败：{auth_err}"
+        res["verdict_level"] = "error"
+    elif res.get("protocol"):
+        res["verdict"] = "第 1 步完成，但未取到模型列表：可手工输入模型名后做第 2 步"
+        res["verdict_level"] = "warn"
+    else:
+        res["verdict"] = "无法连接或 Key 无效"
+        res["verdict_level"] = "error"
+
+
+def _finalize_generation(res: dict, attempted_alt: bool = False) -> None:
+    """第 2 步的结论：可用性判定 + 掺水/降级信号（可反复换模型重测）。"""
+    w = res.setdefault("gen_warnings", [])
+    w.clear()
+    req = res.get("used_model") or res.get("requested_model") or ""
+    got = res.get("returned_model") or ""
+    models = res.get("models") or []
+
+    if res.get("stream_ok"):
+        res["ok"] = True
+    elif res.get("gen_error"):
+        res["ok"] = False
+
+    # 1) 返回模型 vs 请求模型
+    if req and got and norm_model(req) != norm_model(got):
+        w.append(("risk", f"返回模型与请求不一致：请求 {req} → 返回 {got}"
+                          "（可能是站点做了别名映射，也可能被替换/降级，建议用官方对比验证）"))
+    elif req and got:
+        w.append(("ok", f"返回模型与请求一致：{got}"))
+
+    # 2) 首字延迟异常低
+    ft = res.get("first_token_ms")
+    if ft is not None and ft < 250:
+        w.append(("warn", f"首字延迟异常低（{ft:.0f}ms），可能命中缓存或并非真实推理"))
+
+    # 3) 请求的模型是否在站点模型列表里
+    if req and models:
+        ids = {m["id"] for m in models}
+        norms = {norm_model(i) for i in ids}
+        if req not in ids and norm_model(req) not in norms and not attempted_alt:
+            w.append(("warn", f"模型 {req} 不在站点返回的模型列表中（站点列表 {len(models)} 个）"))
+
+    # 4) usage 校验
+    usage = res.get("usage")
+    if res.get("stream_ok"):
+        if not isinstance(usage, dict):
+            w.append(("warn", "响应未返回 usage（token 用量），无法核验计费统计"))
+        else:
+            tot = usage.get("total_tokens") or usage.get("totalTokenCount")
+            if not tot:
+                w.append(("warn", f"usage 中 token 数为 0 或缺失：{json.dumps(usage, ensure_ascii=False)[:120]}"))
+
+    if res.get("gen_error"):
+        hint = detect_panel_hint(res["gen_error"])
+        w.append(("error", f"生成失败：{res['gen_error']}" + (f"（{hint}）" if hint else "")))
+    if attempted_alt:
+        w.append(("info", "该模型要求 max_completion_tokens，已自动适配"))
+
+    # 结论
+    if res["ok"]:
+        bits = [res.get("protocol_label") or "未知协议", f"模型 {req}"]
+        if ft is not None:
+            bits.append(f"首字 {ft:.0f}ms")
+        risky = [x for lvl, x in w if lvl == "risk"]
+        res["verdict"] = ("可用（" + "，".join(bits) + "）" +
+                          ("　⚠ " + risky[0] if risky else ""))
+        res["verdict_level"] = "risk" if risky else "ok"
+    elif res.get("gen_error"):
+        res["verdict"] = f"该模型不可用：{res['gen_error']}"
+        res["verdict_level"] = "error"
+    else:
+        res["verdict"] = "生成测试未完成"
+        res["verdict_level"] = "warn"
+
+
+# =====================================================================
+# 六、批量解析 / 导出
+# =====================================================================
+
+def parse_batch_lines(text: str) -> list[dict]:
+    """每行：URL | KEY | [MODEL]，分隔符支持 | 、制表符、逗号、两个以上空格。"""
+    items = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [p for p in re.split(r"\s*[|\t,]\s*|\s{2,}", line) if p != ""]
+        if not parts:
+            continue
+        if len(parts) == 1:
+            items.append({"url": parts[0], "key": "", "model": ""})
+        elif len(parts) == 2:
+            items.append({"url": parts[0], "key": parts[1], "model": ""})
+        else:
+            items.append({"url": parts[0], "key": parts[1], "model": parts[2]})
+    return items
+
+
+def result_to_row(res: dict) -> dict:
+    return {
+        "输入地址": res.get("input", ""),
+        "归一化Base": res.get("base", ""),
+        "协议": res.get("protocol_label", ""),
+        "HTTP状态": res.get("http_status", ""),
+        "可用": "是" if res.get("ok") else "否",
+        "模型数": res.get("model_count", len(res.get("models") or [])),
+        "模型列表耗时ms": res.get("models_ms", ""),
+        "请求模型": res.get("used_model", ""),
+        "返回模型": res.get("returned_model", ""),
+        "首字延迟ms": round(res["first_token_ms"], 1) if res.get("first_token_ms") is not None else "",
+        "生成总耗时ms": res.get("gen_ms", ""),
+        "站点指纹": res.get("fingerprint", ""),
+        "结论": res.get("verdict", ""),
+        "提示": " ; ".join(x for lvl, x in
+                          (res.get("warnings", []) + res.get("gen_warnings", []))
+                          if lvl in ("risk", "warn", "error")),
+    }
+
+
+def export_csv(rows: list[dict], path: str) -> None:
+    import csv
+    if not rows:
+        return
+    fields = list(rows[0].keys())
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        wr = csv.DictWriter(f, fieldnames=fields)
+        wr.writeheader()
+        for r in rows:
+            wr.writerow({k: r.get(k, "") for k in fields})
+
+
+def export_json(payload, path: str) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+# =====================================================================
+# 七、图形界面
+# =====================================================================
+
+# 「站点」下拉里那个不落盘的临时项
+ADHOC_SITE = "✎ 自定义（临时）"
+
+# 添加/编辑站点对话框里的「常用预设」快速填充
+QUICK_PRESETS = [
+    ("自定义 / 中转站", ""),
+    ("OpenAI 官方", "https://api.openai.com"),
+    ("Anthropic 官方", "https://api.anthropic.com"),
+    ("Gemini 官方", "https://generativelanguage.googleapis.com"),
+    ("DeepSeek", "https://api.deepseek.com"),
+    ("硅基流动 SiliconFlow", "https://api.siliconflow.cn"),
+    ("OpenRouter", "https://openrouter.ai/api/v1"),
+    ("阿里云百炼", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+    ("智谱 GLM", "https://open.bigmodel.cn/api/paas/v4"),
+    ("月之暗面 Kimi", "https://api.moonshot.cn"),
+]
+
+COLORS = {
+    "ok": "#0a7d32",
+    "warn": "#b45309",
+    "risk": "#b91c1c",
+    "error": "#b91c1c",
+    "info": "#1f4e79",
+    "muted": "#6b7280",
+}
+
+LEVEL_LABEL = {
+    "ok": "✔ 校验",
+    "info": "ℹ 提示",
+    "warn": "⚠ 警告",
+    "risk": "⛔ 风险",
+    "error": "✘ 错误",
+}
+
+
+class ProbeApp:
+    def __init__(self, root):
+        import tkinter as tk
+        from tkinter import ttk
+
+        self.tk = tk
+        self.ttk = ttk
+        self.root = root
+        self.q: queue.Queue = queue.Queue()
+        self.stop_event = threading.Event()
+        self.busy = False
+        self.last_result: dict | None = None      # 第 2 步之后的结果（含两段信息）
+        self.site_result: dict | None = None      # 第 1 步的结果，供反复换模型重测
+        self.batch_rows: list[dict] = []
+        self._site_signature = ""                 # 记录第 1 步对应的「地址+Key」，变了就作废
+        self._save_job = None                     # 延迟写盘的 after 句柄
+        # 站点管理：sites 是用户添加的多个中转站，adhoc 是「自定义（临时）」那一格
+        self.sites: list[dict] = []
+        self.adhoc: dict = {"name": ADHOC_SITE, "url": "", "key": "", "model": ""}
+        self._active_site = ADHOC_SITE            # 当前已装载进输入框的那一格
+
+        root.title(f"{APP_NAME} v{APP_VERSION}")
+        root.geometry("1180x760")
+        root.minsize(980, 640)
+        self._setup_style()
+        self._build_ui()
+        self._load_config()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.after(80, self._pump)
+
+    # ---------------- 样式 ----------------
+    def _setup_style(self):
+        ttk = self.ttk
+        style = ttk.Style()
+        for theme in ("vista", "winnative", "clam"):
+            if theme in style.theme_names():
+                try:
+                    style.theme_use(theme)
+                    break
+                except Exception:
+                    pass
+        base_font = ("Microsoft YaHei UI", 9)
+        mono = ("Consolas", 9)
+        style.configure(".", font=base_font)
+        style.configure("Treeview", font=base_font, rowheight=22)
+        style.configure("Treeview.Heading", font=("Microsoft YaHei UI", 9, "bold"))
+        style.configure("Title.TLabel", font=("Microsoft YaHei UI", 12, "bold"))
+        style.configure("Hint.TLabel", foreground=COLORS["muted"])
+        self.mono_font = mono
+
+    # ---------------- 界面 ----------------
+    def _build_ui(self):
+        tk, ttk = self.tk, self.ttk
+
+        # 顶部：输入区
+        top = ttk.LabelFrame(self.root, text=" 连接信息 ")
+        top.pack(fill="x", padx=10, pady=(10, 6))
+
+        row1 = ttk.Frame(top)
+        row1.pack(fill="x", padx=8, pady=(8, 4))
+        ttk.Label(row1, text="站点").pack(side="left")
+        self.var_site = tk.StringVar(value=ADHOC_SITE)
+        self.cmb_site = ttk.Combobox(row1, textvariable=self.var_site, width=26,
+                                     values=[ADHOC_SITE], state="readonly")
+        self.cmb_site.pack(side="left", padx=(6, 6))
+        self.cmb_site.bind("<<ComboboxSelected>>", self._on_site_change)
+        ttk.Button(row1, text="＋ 添加站点", command=self.add_site).pack(side="left")
+        self.btn_edit_site = ttk.Button(row1, text="编辑", command=self.edit_site, state="disabled")
+        self.btn_edit_site.pack(side="left", padx=4)
+        self.btn_del_site = ttk.Button(row1, text="删除", command=self.delete_site, state="disabled")
+        self.btn_del_site.pack(side="left")
+
+        self.var_timeout = tk.StringVar(value=str(int(DEFAULT_TIMEOUT)))
+        ttk.Spinbox(row1, from_=3, to=180, increment=1, width=5,
+                    textvariable=self.var_timeout).pack(side="right")
+        ttk.Label(row1, text="超时(秒)").pack(side="right", padx=(0, 6))
+
+        row_url = ttk.Frame(top)
+        row_url.pack(fill="x", padx=8, pady=(0, 4))
+        ttk.Label(row_url, text="API 地址").pack(side="left")
+        self.var_url = tk.StringVar()
+        self.ent_url = ttk.Entry(row_url, textvariable=self.var_url, font=self.mono_font)
+        self.ent_url.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        self.ent_url.bind("<Return>", lambda e: self.fetch_models())
+        self.ent_url.bind("<KeyRelease>", self._on_conn_changed)
+
+        row2 = ttk.Frame(top)
+        row2.pack(fill="x", padx=8, pady=(0, 4))
+        ttk.Label(row2, text="API Key").pack(side="left")
+        self.var_key = tk.StringVar()
+        self.ent_key = ttk.Entry(row2, textvariable=self.var_key, show="*", font=self.mono_font)
+        self.ent_key.pack(side="left", fill="x", expand=True, padx=(6, 8))
+        self.ent_key.bind("<Return>", lambda e: self.fetch_models())
+        self.ent_key.bind("<KeyRelease>", self._on_conn_changed)
+        self.var_show = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row2, text="显示", variable=self.var_show,
+                        command=self._toggle_key).pack(side="left")
+
+        ttk.Label(row2, text="指定模型").pack(side="left", padx=(14, 0))
+        self.var_model = tk.StringVar()
+        ent_model = ttk.Entry(row2, textvariable=self.var_model, width=26, font=self.mono_font)
+        ent_model.pack(side="left", padx=(6, 0))
+        ent_model.bind("<Return>", lambda e: self.run_generation())
+
+        row3 = ttk.Frame(top)
+        row3.pack(fill="x", padx=8, pady=(0, 8))
+        self.var_verify = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row3, text="校验 TLS 证书（自签站可取消）",
+                        variable=self.var_verify).pack(side="left")
+        self.var_deep = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row3, text="深度检测（补测 usage）",
+                        variable=self.var_deep).pack(side="left", padx=(12, 0))
+        self.var_remember = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row3, text="记住 Key（本机加密保存，含批量列表）",
+                        variable=self.var_remember,
+                        command=self._on_remember_toggle).pack(side="left", padx=(12, 0))
+        ttk.Button(row3, text="清除已存 Key",
+                   command=self.clear_saved_key).pack(side="left", padx=(8, 0))
+        ttk.Label(row3, text=f"配置：{CONFIG_PATH}", style="Hint.TLabel").pack(side="right")
+
+        btns = ttk.Frame(top)
+        btns.pack(fill="x", padx=8, pady=(0, 8))
+        self.btn_list = ttk.Button(btns, text="①  获取模型列表", command=self.fetch_models)
+        self.btn_list.pack(side="left")
+        self.btn_gen = ttk.Button(btns, text="②  对选中模型发测试", command=self.run_generation,
+                                  state="disabled")
+        self.btn_gen.pack(side="left", padx=6)
+        self.btn_stop = ttk.Button(btns, text="■  停止", command=self.stop, state="disabled")
+        self.btn_stop.pack(side="left", padx=6)
+        ttk.Button(btns, text="复制结论", command=self.copy_verdict).pack(side="left", padx=(18, 4))
+        ttk.Button(btns, text="导出 JSON", command=lambda: self.export_last("json")).pack(side="left", padx=4)
+        ttk.Button(btns, text="导出 CSV", command=lambda: self.export_last("csv")).pack(side="left", padx=4)
+        self.lbl_status = ttk.Label(btns, text="就绪", style="Hint.TLabel")
+        self.lbl_status.pack(side="right")
+
+        # 中部：标签页
+        self.nb = ttk.Notebook(self.root)
+        self.nb.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+
+        self._build_tab_overview()
+        self._build_tab_models()
+        self._build_tab_batch()
+        self._build_tab_log()
+
+        # 底部状态
+        bottom = ttk.Frame(self.root)
+        bottom.pack(fill="x", padx=10, pady=(0, 8))
+        self.lbl_summary = ttk.Label(bottom, text="第 ① 步拉取模型列表 → 在「模型列表」里挑一个模型 → 第 ② 步发测试。"
+                                                 "地址支持直接粘贴 https://xxx.com/v1/chat/completions 这种完整写法。",
+                                     style="Hint.TLabel")
+        self.lbl_summary.pack(side="left")
+
+    def _build_tab_overview(self):
+        tk, ttk = self.tk, self.ttk
+        frame = ttk.Frame(self.nb)
+        self.nb.add(frame, text="  概览  ")
+
+        self.tv_ov = ttk.Treeview(frame, columns=("item", "value"), show="headings", height=18)
+        self.tv_ov.heading("item", text="项目")
+        self.tv_ov.heading("value", text="结果")
+        self.tv_ov.column("item", width=150, anchor="w", stretch=False)
+        self.tv_ov.column("value", width=900, anchor="w")
+        vs = ttk.Scrollbar(frame, orient="vertical", command=self.tv_ov.yview)
+        self.tv_ov.configure(yscrollcommand=vs.set)
+        self.tv_ov.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
+        vs.pack(side="right", fill="y", pady=6, padx=(0, 6))
+        for lvl, color in COLORS.items():
+            self.tv_ov.tag_configure(lvl, foreground=color)
+        self.tv_ov.tag_configure("head", font=("Microsoft YaHei UI", 10, "bold"))
+
+    def _build_tab_models(self):
+        tk, ttk = self.tk, self.ttk
+        frame = ttk.Frame(self.nb)
+        self.nb.add(frame, text="  模型列表  ")
+
+        bar = ttk.Frame(frame)
+        bar.pack(fill="x", padx=6, pady=(6, 0))
+        ttk.Label(bar, text="过滤").pack(side="left")
+        self.var_filter = tk.StringVar()
+        ent = ttk.Entry(bar, textvariable=self.var_filter, width=32, font=self.mono_font)
+        ent.pack(side="left", padx=6)
+        ent.bind("<KeyRelease>", lambda e: self._refresh_models())
+        self.var_only_main = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bar, text="只看主流模型", variable=self.var_only_main,
+                        command=self._refresh_models).pack(side="left", padx=8)
+        ttk.Button(bar, text="复制全部模型名", command=self.copy_models).pack(side="left", padx=6)
+        ttk.Button(bar, text="导出模型列表", command=self.export_models).pack(side="left")
+        self.lbl_models = ttk.Label(bar, text="（尚未测试）", style="Hint.TLabel")
+        self.lbl_models.pack(side="right", padx=6)
+
+        bar2 = ttk.Frame(frame)
+        bar2.pack(fill="x", padx=6, pady=(6, 0))
+        ttk.Label(bar2, text="当前选中：").pack(side="left")
+        self.lbl_picked = ttk.Label(bar2, text="（未选择）", font=self.mono_font,
+                                    foreground=COLORS["info"])
+        self.lbl_picked.pack(side="left")
+        ttk.Button(bar2, text="②  用选中模型发测试",
+                   command=self.run_generation).pack(side="left", padx=10)
+        ttk.Label(bar2, text="单击选中 / 双击直接测试；列表里没有的模型，可直接在上方「指定模型」手写。",
+                  style="Hint.TLabel").pack(side="left", padx=4)
+
+        body = ttk.Frame(frame)
+        body.pack(fill="both", expand=True, padx=6, pady=6)
+        self.tv_models = ttk.Treeview(body, columns=("idx", "id", "tag", "owner"),
+                                      show="headings", selectmode="browse")
+        for col, txt, w, anchor in (("idx", "#", 60, "e"), ("id", "模型 ID", 520, "w"),
+                                    ("tag", "标记", 120, "w"), ("owner", "归属/备注", 220, "w")):
+            self.tv_models.heading(col, text=txt)
+            self.tv_models.column(col, width=w, anchor=anchor, stretch=(col == "id"))
+        vs = ttk.Scrollbar(body, orient="vertical", command=self.tv_models.yview)
+        self.tv_models.configure(yscrollcommand=vs.set)
+        self.tv_models.pack(side="left", fill="both", expand=True)
+        vs.pack(side="right", fill="y")
+        self.tv_models.bind("<<TreeviewSelect>>", self._on_model_select)
+        self.tv_models.bind("<Double-1>", self._on_model_dclick)
+
+    def _build_tab_batch(self):
+        tk, ttk = self.tk, self.ttk
+        frame = ttk.Frame(self.nb)
+        self.nb.add(frame, text="  批量测试  ")
+
+        left = ttk.LabelFrame(frame, text=" 每行一个站点：地址 | Key | [模型]（批量模式自动挑模型；想指定就写第三列） ")
+        left.pack(side="left", fill="both", expand=False, padx=(6, 4), pady=6)
+        self.txt_batch = tk.Text(left, width=46, height=20, font=self.mono_font, wrap="none")
+        self.txt_batch.pack(fill="both", expand=True, padx=6, pady=6)
+        self.txt_batch.insert("1.0",
+                              "# 示例（以 # 开头的行会被忽略）\n"
+                              "https://api.deepseek.com | sk-xxxxxxxx | deepseek-chat\n"
+                              "https://your-relay.com/v1 | sk-yyyyyyyy\n")
+        self.txt_batch.bind("<KeyRelease>", lambda e: self._schedule_save())
+
+        right = ttk.Frame(frame)
+        right.pack(side="left", fill="both", expand=True, padx=(4, 6), pady=6)
+
+        bar = ttk.Frame(right)
+        bar.pack(fill="x")
+        self.btn_batch = ttk.Button(bar, text="▶  开始批量测试", command=self.start_batch)
+        self.btn_batch.pack(side="left")
+        ttk.Label(bar, text="并发").pack(side="left", padx=(10, 2))
+        self.var_workers = tk.StringVar(value="2")
+        ttk.Spinbox(bar, from_=1, to=8, width=4, textvariable=self.var_workers).pack(side="left")
+        ttk.Button(bar, text="导出 CSV", command=lambda: self.export_batch("csv")).pack(side="left", padx=8)
+        ttk.Button(bar, text="导出 JSON", command=lambda: self.export_batch("json")).pack(side="left")
+        ttk.Button(bar, text="导入站点列表", command=self.import_sites_to_batch).pack(side="left", padx=8)
+        ttk.Button(bar, text="清空结果", command=self._clear_batch).pack(side="left", padx=8)
+
+        cols = ("url", "proto", "status", "ms", "first", "n", "models", "panel", "verdict")
+        heads = (("url", "地址", 240), ("proto", "协议", 110), ("status", "HTTP", 60),
+                 ("ms", "列表ms", 70), ("first", "首字ms", 70), ("n", "模型数", 70),
+                 ("models", "请求→返回模型", 260), ("panel", "指纹", 150), ("verdict", "结论", 340))
+        self.tv_batch = ttk.Treeview(right, columns=cols, show="headings")
+        for c, txt, w in heads:
+            self.tv_batch.heading(c, text=txt)
+            self.tv_batch.column(c, width=w, anchor="w", stretch=(c in ("verdict", "url")))
+        vs = ttk.Scrollbar(right, orient="vertical", command=self.tv_batch.yview)
+        self.tv_batch.configure(yscrollcommand=vs.set)
+        self.tv_batch.pack(side="left", fill="both", expand=True, pady=(6, 0))
+        vs.pack(side="right", fill="y", pady=(6, 0))
+        for lvl, color in COLORS.items():
+            self.tv_batch.tag_configure(lvl, foreground=color)
+        self.tv_batch.bind("<Double-1>", self._on_batch_dclick)
+
+    def _build_tab_log(self):
+        tk, ttk = self.tk, self.ttk
+        frame = ttk.Frame(self.nb)
+        self.nb.add(frame, text="  原始日志  ")
+        bar = ttk.Frame(frame)
+        bar.pack(fill="x", padx=6, pady=(6, 0))
+        ttk.Button(bar, text="清空日志", command=lambda: self._log_clear()).pack(side="left")
+        ttk.Button(bar, text="复制日志", command=self.copy_log).pack(side="left", padx=6)
+        ttk.Label(bar, text="每个 HTTP 请求的地址、状态码、耗时；失败时含响应片段。",
+                  style="Hint.TLabel").pack(side="left", padx=10)
+        self.txt_log = tk.Text(frame, font=self.mono_font, wrap="word", state="disabled",
+                               background="#111827", foreground="#e5e7eb", insertbackground="#e5e7eb")
+        self.txt_log.pack(fill="both", expand=True, padx=6, pady=6)
+
+    # ---------------- 小工具 ----------------
+    def _toggle_key(self):
+        self.ent_key.configure(show="" if self.var_show.get() else "*")
+
+    # ---------------- 站点管理（多个中转站） ----------------
+    def _site_index(self, name: str) -> int:
+        for i, s in enumerate(self.sites):
+            if s.get("name") == name:
+                return i
+        return -1
+
+    def _record_for(self, name: str):
+        """按名字取站点记录；「自定义」返回 adhoc 那一格。"""
+        if name == ADHOC_SITE:
+            return self.adhoc
+        i = self._site_index(name)
+        return self.sites[i] if i >= 0 else None
+
+    def _current_record(self):
+        return self._record_for(self.var_site.get())
+
+    def _stash_current_fields(self) -> None:
+        """把输入框里当前的 地址/Key/模型 写回「当前装载的那一格」。
+
+        必须是 _active_site（上一次真正装载的），不能用下拉框的当前值 —— 否则
+        切换站点的瞬间会把旧站点的内容覆盖到新站点上。
+        """
+        rec = self._record_for(self._active_site)
+        if rec is None:
+            return
+        rec["url"] = self.var_url.get().strip()
+        rec["key"] = self.var_key.get().strip()
+        rec["model"] = self.var_model.get().strip()
+
+    def _apply_record(self, rec: dict) -> None:
+        self.var_url.set(rec.get("url", "") or "")
+        self.var_key.set(rec.get("key", "") or "")
+        self.var_model.set(rec.get("model", "") or "")
+
+    def _refresh_site_combo(self) -> None:
+        self.cmb_site.configure(values=[ADHOC_SITE] + [s["name"] for s in self.sites])
+        is_real = self._current_record() is not None
+        self.btn_edit_site.configure(state="normal" if is_real else "disabled")
+        self.btn_del_site.configure(state="normal" if is_real else "disabled")
+
+    def _invalidate_results(self) -> None:
+        """站点/Key 变了：上一次拉到的模型列表与测试结果作废。"""
+        self.site_result = None
+        self.last_result = None
+        self._site_signature = ""
+        self.btn_gen.configure(state="disabled")
+        self.lbl_picked.configure(text="（未选择）")
+        self.tv_ov.delete(*self.tv_ov.get_children())
+        self.tv_models.delete(*self.tv_models.get_children())
+        self.lbl_models.configure(text="（尚未获取列表）")
+        try:
+            self.nb.select(0)
+        except Exception:
+            pass
+
+    def _select_site(self, name: str) -> None:
+        self.var_site.set(name)
+        self._on_site_change()
+
+    def _on_site_change(self, _evt=None) -> None:
+        """切换站点：先把旧站点输入框内容存回去，再装载新站点的地址/Key/模型。"""
+        self._stash_current_fields()
+        name = self.var_site.get()
+        rec = self._record_for(name)
+        if rec is None:
+            self.var_site.set(ADHOC_SITE)
+            name, rec = ADHOC_SITE, self.adhoc
+        self._active_site = name
+        self._apply_record(rec)
+        self._invalidate_results()
+        self._refresh_site_combo()
+        self._save_config()
+        if name == ADHOC_SITE:
+            self._set_status("已切到「自定义（临时）」：这一格的地址/Key 也会各自记住")
+        elif not self.var_remember.get() and not rec.get("key"):
+            self._set_status(f"已切换到「{name}」：未勾选「记住 Key」，请粘贴 Key 后再测试")
+        else:
+            self._set_status(f"已切换到「{name}」")
+
+    def _add_site_record(self, name: str, url: str, key: str = "", model: str = "",
+                         select: bool = True) -> bool:
+        name = (name or "").strip()
+        if not name or name == ADHOC_SITE or self._site_index(name) >= 0:
+            return False
+        self.sites.append({"name": name, "url": (url or "").strip(),
+                           "key": (key or "").strip(), "model": (model or "").strip()})
+        self._refresh_site_combo()
+        if select:
+            self._select_site(name)
+        return True
+
+    def _update_site_record(self, old_name: str, name: str, url: str, key: str,
+                            model: str) -> bool:
+        i = self._site_index(old_name)
+        if i < 0:
+            return False
+        name = (name or "").strip()
+        if not name or name == ADHOC_SITE:
+            return False
+        if name != old_name and self._site_index(name) >= 0:
+            return False
+        was_active = self._active_site == old_name
+        self.sites[i] = {"name": name, "url": (url or "").strip(),
+                         "key": (key or "").strip(), "model": (model or "").strip()}
+        self._refresh_site_combo()
+        if was_active:
+            self._active_site = name
+            self.var_site.set(name)
+            self._apply_record(self.sites[i])
+            self._invalidate_results()
+        return True
+
+    def _delete_site_record(self, name: str) -> bool:
+        i = self._site_index(name)
+        if i < 0:
+            return False
+        was_active = self._active_site == name
+        self.sites.pop(i)
+        self._refresh_site_combo()
+        if was_active:
+            self._select_site(ADHOC_SITE)
+        return True
+
+    def _site_dialog(self, title: str, initial: dict):
+        """弹出添加/编辑站点对话框，返回 dict 或 None。"""
+        tk, ttk = self.tk, self.ttk
+        dlg = tk.Toplevel(self.root)
+        dlg.title(title)
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        out = {"value": None}
+
+        body = ttk.Frame(dlg)
+        body.pack(fill="both", expand=True, padx=14, pady=12)
+        v_name = tk.StringVar(value=initial.get("name", "") or "")
+        v_url = tk.StringVar(value=initial.get("url", "") or "")
+        v_key = tk.StringVar(value=initial.get("key", "") or "")
+        v_model = tk.StringVar(value=initial.get("model", "") or "")
+
+        def add_row(r, label, var, width=54, show=None):
+            ttk.Label(body, text=label).grid(row=r, column=0, sticky="w", pady=4)
+            ent = ttk.Entry(body, textvariable=var, width=width, font=self.mono_font, show=show)
+            ent.grid(row=r, column=1, sticky="we", padx=(8, 0), pady=4)
+            return ent
+
+        e_name = add_row(0, "站点名称", v_name, 30)
+        ttk.Label(body, text="常用预设").grid(row=1, column=0, sticky="w", pady=4)
+        v_preset = tk.StringVar(value=QUICK_PRESETS[0][0])
+        cmb = ttk.Combobox(body, textvariable=v_preset, values=[n for n, _ in QUICK_PRESETS],
+                           state="readonly", width=30)
+        cmb.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=4)
+
+        def apply_preset(_e=None):
+            for n, u in QUICK_PRESETS:
+                if n == v_preset.get() and u:
+                    v_url.set(u)
+                    if not v_name.get().strip():
+                        v_name.set(n)
+                    break
+        cmb.bind("<<ComboboxSelected>>", apply_preset)
+
+        add_row(2, "API 地址", v_url)
+        add_row(3, "API Key", v_key, show="*")
+        add_row(4, "默认模型", v_model, 30)
+        ttk.Label(body, text="（默认模型可留空，之后在模型列表里挑也行）",
+                  style="Hint.TLabel").grid(row=4, column=2, sticky="w", padx=(6, 0))
+        hint = ("已勾选「记住 Key」：Key 会加密保存到本机，切换站点自动带出。"
+                if self.var_remember.get() else
+                "注意：当前未勾选「记住 Key」，这里填的 Key 不会写盘（只在本次运行内有效）。")
+        ttk.Label(body, text=hint, style="Hint.TLabel", wraplength=430).grid(
+            row=5, column=1, sticky="w", pady=(2, 0))
+        err = ttk.Label(body, text="", foreground=COLORS["risk"])
+        err.grid(row=6, column=1, sticky="w")
+
+        def ok(_e=None):
+            name = v_name.get().strip()
+            url = v_url.get().strip()
+            if not name:
+                err.configure(text="请填写站点名称")
+                return
+            if name == ADHOC_SITE:
+                err.configure(text="这个名称被内置项占用了，换一个")
+                return
+            if not url:
+                err.configure(text="请填写 API 地址")
+                return
+            if name != initial.get("name") and self._site_index(name) >= 0:
+                err.configure(text=f"站点名「{name}」已存在")
+                return
+            out["value"] = {"name": name, "url": url, "key": v_key.get().strip(),
+                            "model": v_model.get().strip()}
+            dlg.destroy()
+
+        bar = ttk.Frame(body)
+        bar.grid(row=7, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(bar, text="确定", command=ok).pack(side="left", padx=4)
+        ttk.Button(bar, text="取消", command=dlg.destroy).pack(side="left")
+        dlg.bind("<Return>", ok)
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        e_name.focus_set()
+        self.root.wait_window(dlg)
+        return out["value"]
+
+    def add_site(self):
+        init = {"name": "", "url": self.var_url.get().strip(),
+                "key": self.var_key.get().strip(), "model": self.var_model.get().strip()}
+        data = self._site_dialog("添加站点", init)
+        if not data:
+            return
+        if self._add_site_record(data["name"], data["url"], data["key"], data["model"]):
+            self._save_config()
+            self._set_status(f"已添加站点「{data['name']}」，可用它做第 ① 步")
+
+    def edit_site(self):
+        rec = self._current_record()
+        if rec is None:
+            self._set_status("请先在下拉里选择一个已保存的站点（「自定义」不能编辑）")
+            return
+        self._stash_current_fields()
+        old_name = rec["name"]
+        data = self._site_dialog(f"编辑站点 - {old_name}", dict(rec))
+        if not data:
+            return
+        if self._update_site_record(old_name, data["name"], data["url"], data["key"],
+                                    data["model"]):
+            self._save_config()
+            self._set_status(f"已更新站点「{data['name']}」")
+
+    def delete_site(self):
+        from tkinter import messagebox
+        rec = self._current_record()
+        if rec is None:
+            self._set_status("「自定义（临时）」不能删除，请先选中一个已保存的站点")
+            return
+        if not messagebox.askyesno("删除站点", f"确定删除站点「{rec['name']}」？"):
+            return
+        name = rec["name"]
+        if self._delete_site_record(name):
+            self._save_config()
+            self._set_status(f"已删除站点「{name}」")
+
+    def import_sites_to_batch(self):
+        """把所有已保存的站点导入批量测试框，一键巡检多个中转站。"""
+        self._stash_current_fields()
+        lines = []
+        for s in self.sites:
+            parts = [s.get("url", ""), s.get("key", ""), s.get("model", "")]
+            while parts and not parts[-1]:
+                parts.pop()
+            if parts and parts[0]:
+                lines.append(" | ".join(parts))
+        if self.var_url.get().strip() and self._active_site == ADHOC_SITE:
+            parts = [self.var_url.get().strip(), self.var_key.get().strip(),
+                     self.var_model.get().strip()]
+            while parts and not parts[-1]:
+                parts.pop()
+            lines.insert(0, " | ".join(parts))
+        if not lines:
+            self._set_status("站点列表是空的，先点「＋ 添加站点」")
+            return
+        self.txt_batch.delete("1.0", "end")
+        self.txt_batch.insert("1.0", "\n".join(lines) + "\n")
+        self._save_config()
+        self._set_status(f"已把 {len(lines)} 个站点导入批量列表")
+
+    def _log(self, msg: str):
+        self.q.put(("log", msg))
+
+    def _log_clear(self):
+        self.txt_log.configure(state="normal")
+        self.txt_log.delete("1.0", "end")
+        self.txt_log.configure(state="disabled")
+
+    def _log_append(self, msg: str):
+        self.txt_log.configure(state="normal")
+        ts = time.strftime("%H:%M:%S")
+        self.txt_log.insert("end", f"{ts}  {msg}\n")
+        if int(self.txt_log.index("end-1c").split(".")[0]) > 4000:
+            self.txt_log.delete("1.0", "500.0")
+        self.txt_log.see("end")
+        self.txt_log.configure(state="disabled")
+
+    def _set_status(self, text: str):
+        self.lbl_status.configure(text=text)
+
+    def copy_log(self):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.txt_log.get("1.0", "end-1c"))
+        self._set_status("日志已复制")
+
+    def copy_verdict(self):
+        if not self.last_result:
+            self._set_status("还没有测试结果")
+            return
+        res = self.last_result
+        lines = [f"地址: {res.get('base')}", f"结论: {res.get('verdict')}",
+                 f"协议: {res.get('protocol_label')}", f"模型数: {res.get('model_count', 0)}",
+                 f"请求模型: {res.get('used_model')}", f"返回模型: {res.get('returned_model')}",
+                 f"首字延迟: {res.get('first_token_ms')} ms", f"指纹: {res.get('fingerprint')}"]
+        lines += [f"[{lvl}] {t}" for lvl, t in
+                  (res.get("warnings", []) + res.get("gen_warnings", []))]
+        self.root.clipboard_clear()
+        self.root.clipboard_append("\n".join(lines))
+        self._set_status("结论已复制到剪贴板")
+
+    def copy_models(self):
+        ids = [self.tv_models.set(i, "id") for i in self.tv_models.get_children()]
+        if not ids:
+            self._set_status("模型列表为空")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append("\n".join(ids))
+        self._set_status(f"已复制 {len(ids)} 个模型名")
+
+    # ---------------- 配置持久化 ----------------
+    # 保存位置：~/.api_probe.json（config_version 3）
+    #   明文：各站点 名称/地址/默认模型、超时、各开关、窗口大小
+    #   加密：各站点的 Key 与批量列表 —— 只有勾选「记住 Key」才写盘，用 Windows DPAPI 加密
+    def _load_config(self):
+        try:
+            if not CONFIG_PATH.exists():
+                return
+            cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            if not isinstance(cfg, dict):
+                return
+        except Exception:
+            return
+        try:
+            self.var_timeout.set(str(cfg.get("timeout", int(DEFAULT_TIMEOUT))))
+            self.var_verify.set(bool(cfg.get("verify_tls", True)))
+            self.var_deep.set(bool(cfg.get("deep_check", True)))
+            self.var_only_main.set(bool(cfg.get("only_mainstream", False)))
+            self.var_workers.set(str(cfg.get("workers", 2)))
+            geo = str(cfg.get("geometry") or "")
+            if re.fullmatch(r"\d+x\d+([+-]\d+[+-]\d+)?", geo):
+                self.root.geometry(geo)
+        except Exception:
+            pass
+        remember = bool(cfg.get("remember_key", False))
+        self.var_remember.set(remember)
+
+        # 站点列表
+        self.sites = []
+        for s in cfg.get("sites") or []:
+            if not isinstance(s, dict):
+                continue
+            name = str(s.get("name") or "").strip()
+            if not name or name == ADHOC_SITE:
+                continue
+            key = ""
+            if remember and s.get("key"):
+                key = decode_secret(str(s["key"]), bool(s.get("key_encrypted", False)))
+            self.sites.append({"name": name, "url": str(s.get("url") or ""),
+                               "model": str(s.get("model") or ""), "key": key})
+        # 「自定义（临时）」那一格
+        ad = cfg.get("adhoc") if isinstance(cfg.get("adhoc"), dict) else {}
+        adhoc_key = ""
+        if remember:
+            blob = str(ad.get("key") or "") or str(cfg.get("key") or "")
+            enc = bool(ad.get("key_encrypted", cfg.get("key_encrypted", False)))
+            adhoc_key = decode_secret(blob, enc)
+        self.adhoc = {"name": ADHOC_SITE,
+                      "url": str(ad.get("url") or cfg.get("url") or ""),
+                      "model": str(ad.get("model") or cfg.get("model") or ""),
+                      "key": adhoc_key}
+        # v1/v2 -> v3 迁移：老配置只有一个 url，把它变成一个站点，免得用户以为丢了
+        if not self.sites and int(cfg.get("config_version") or 1) < 3 and self.adhoc["url"]:
+            self.sites.append({"name": "默认站点", "url": self.adhoc["url"],
+                               "model": self.adhoc["model"], "key": self.adhoc["key"]})
+        # 当前选中的站点
+        names = [ADHOC_SITE] + [s["name"] for s in self.sites]
+        cur = str(cfg.get("current_site") or "")
+        if cur not in names:
+            cur = self.sites[0]["name"] if self.sites else ADHOC_SITE
+        self._active_site = cur
+        self.var_site.set(cur)
+        self._refresh_site_combo()
+        self._apply_record(self._record_for(cur) or self.adhoc)
+
+        if remember:
+            batch = decode_secret(str(cfg.get("batch_text") or ""),
+                                  bool(cfg.get("batch_encrypted", False)))
+            if batch:
+                self.txt_batch.delete("1.0", "end")
+                self.txt_batch.insert("1.0", batch)
+
+    def _save_config(self):
+        try:
+            self._stash_current_fields()
+            remember = bool(self.var_remember.get())
+            sites_out = []
+            for s in self.sites:
+                rec = {"name": s.get("name", ""), "url": s.get("url", ""),
+                       "model": s.get("model", "")}
+                if remember and s.get("key"):
+                    rec["key"], rec["key_encrypted"] = encode_secret(s["key"])
+                sites_out.append(rec)
+            adhoc_out = {"url": self.adhoc.get("url", ""), "model": self.adhoc.get("model", "")}
+            if remember and self.adhoc.get("key"):
+                adhoc_out["key"], adhoc_out["key_encrypted"] = encode_secret(self.adhoc["key"])
+            batch_blob, batch_enc = ("", True)
+            if remember:
+                batch_blob, batch_enc = encode_secret(
+                    self.txt_batch.get("1.0", "end-1c").strip())
+            cfg = {
+                "config_version": 3,
+                "current_site": self.var_site.get(),
+                "sites": sites_out,
+                "adhoc": adhoc_out,
+                "timeout": self._timeout(),
+                "verify_tls": bool(self.var_verify.get()),
+                "deep_check": bool(self.var_deep.get()),
+                "only_mainstream": bool(self.var_only_main.get()),
+                "workers": self._workers(),
+                "remember_key": remember,
+                "batch_text": batch_blob,
+                "batch_encrypted": batch_enc,
+            }
+            # 顶层再冗余一份「当前站点」，方便人肉查看，也让旧版本仍能读到地址
+            cfg["url"] = self.var_url.get().strip()
+            cfg["model"] = self.var_model.get().strip()
+            if remember:
+                cfg["key"], cfg["key_encrypted"] = encode_secret(self.var_key.get().strip())
+            else:
+                cfg["key"], cfg["key_encrypted"] = "", True
+            try:
+                if self.root.winfo_viewable():
+                    cfg["geometry"] = self.root.geometry()
+            except Exception:
+                pass
+            CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2),
+                                   encoding="utf-8")
+        except Exception:
+            pass
+
+    def _schedule_save(self, delay: int = 1200):
+        """改动后延迟写盘，避免每敲一个键就写一次文件。"""
+        try:
+            if self._save_job:
+                self.root.after_cancel(self._save_job)
+            self._save_job = self.root.after(delay, self._save_now)
+        except Exception:
+            self._save_job = None
+
+    def _save_now(self):
+        self._save_job = None
+        self._save_config()
+
+    def _on_remember_toggle(self):
+        self._save_config()          # 立即生效：取消勾选会同时清掉文件里的 Key
+        if self.var_remember.get():
+            extra = "" if dpapi_available() else "（本机不支持加密，将以明文保存）"
+            self._set_status(f"已记住 Key，保存在 {CONFIG_PATH}{extra}")
+        else:
+            self._set_status(f"已取消记住，配置文件里的 Key 已清空（{CONFIG_PATH}）")
+
+    def _clear_all_saved_keys(self):
+        """清空所有站点（含自定义格）已保存的 Key，并把文件里的 Key 抹掉。"""
+        for s in self.sites:
+            s["key"] = ""
+        self.adhoc["key"] = ""
+        self.var_key.set("")
+        self._save_config()
+
+    def clear_saved_key(self):
+        from tkinter import messagebox
+        n = sum(1 for s in self.sites if s.get("key")) + (1 if self.adhoc.get("key") else 0)
+        if not messagebox.askyesno("清除已存 Key",
+                                   f"将清空 {n} 处已保存的 Key（站点列表与当前输入框），确定？"):
+            return
+        self._clear_all_saved_keys()
+        self._set_status(f"已清空保存的 Key：{CONFIG_PATH}")
+
+    def _on_close(self):
+        self.stop_event.set()
+        self._save_config()
+        self.root.destroy()
+
+    def _timeout(self) -> float:
+        try:
+            return max(3.0, float(self.var_timeout.get()))
+        except Exception:
+            return DEFAULT_TIMEOUT
+
+    def _workers(self) -> int:
+        try:
+            return max(1, min(8, int(self.var_workers.get())))
+        except Exception:
+            return 2
+
+    # ---------------- 第 1 步：拉取模型列表 ----------------
+    def fetch_models(self):
+        if self.busy:
+            self._set_status("正在测试中，请稍候…")
+            return
+        url = self.var_url.get().strip()
+        if not url:
+            self._set_status("请先填写 API 地址")
+            return
+        key = self.var_key.get().strip()
+        self.stop_event.clear()
+        self._save_config()
+        self._log_clear()
+        self._set_status("第 1 步：正在拉取模型列表…")
+        self.busy = True
+        self.btn_list.configure(state="disabled")
+        self.btn_gen.configure(state="disabled")
+        self.btn_batch.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
+        self.tv_ov.delete(*self.tv_ov.get_children())
+        self.tv_models.delete(*self.tv_models.get_children())
+        self.site_result = None
+        self.last_result = None
+        self.lbl_picked.configure(text="（未选择）")
+        self.lbl_summary.configure(text=f"正在拉取 {url} 的模型列表 …")
+        self._log_append(f"=== 第 1 步：获取模型列表 {url} （Key: {mask_key(key)}） ===")
+        # 注意：Tk 变量只能在主线程读，先取好值再交给 worker 线程
+        timeout, verify = self._timeout(), bool(self.var_verify.get())
+
+        def work():
+            try:
+                res = probe_site(url, key, timeout=timeout, verify=verify, log=self._log,
+                                 stop_event=self.stop_event)
+                self.q.put(("site_done", res))
+            except Exception as e:  # noqa: BLE001
+                self.q.put(("fatal", f"{type(e).__name__}: {e}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---------------- 第 2 步：用人工选中的模型发测试 ----------------
+    def run_generation(self):
+        if self.busy:
+            self._set_status("正在测试中，请稍候…")
+            return
+        if not self.site_result:
+            self._set_status("请先点「① 获取模型列表」")
+            return
+        model = self.var_model.get().strip()
+        if not model:
+            self._set_status("请先在「模型列表」里选一个模型（或在上方「指定模型」里手写一个）")
+            self.nb.select(1)
+            return
+        site = self.site_result
+        key = self.var_key.get().strip()
+        self.stop_event.clear()
+        self.busy = True
+        self.btn_list.configure(state="disabled")
+        self.btn_gen.configure(state="disabled")
+        self.btn_batch.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
+        self._set_status(f"第 2 步：正在用 {model} 发测试…")
+        self._log_append(f"=== 第 2 步：生成测试，模型 = {model} ===")
+        # Tk 变量只在主线程读
+        timeout = self._timeout()
+        verify = bool(self.var_verify.get())
+        deep = bool(self.var_deep.get())
+
+        def work():
+            try:
+                res = probe_generate(site, key, model, timeout=timeout, verify=verify,
+                                     deep=deep, log=self._log, stop_event=self.stop_event)
+                self.q.put(("gen_done", res))
+            except Exception as e:  # noqa: BLE001
+                self.q.put(("fatal", f"{type(e).__name__}: {e}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def stop(self):
+        self.stop_event.set()
+        self._set_status("正在停止…")
+        self._log_append("用户请求停止")
+
+    # ---------------- 批量测试 ----------------
+    def start_batch(self):
+        if self.busy:
+            self._set_status("正在测试中，请稍候…")
+            return
+        items = parse_batch_lines(self.txt_batch.get("1.0", "end"))
+        if not items:
+            self._set_status("批量输入为空")
+            return
+        self.stop_event.clear()
+        self._clear_batch()
+        self.busy = True
+        self.btn_batch.configure(state="disabled")
+        self.btn_list.configure(state="disabled")
+        self.btn_gen.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
+        self._log_append(f"=== 批量测试开始，共 {len(items)} 个站点 ===")
+        workers = self._workers()
+        self._save_config()                       # 顺手把批量列表存下来
+        # Tk 变量只在主线程读
+        timeout = self._timeout()
+        verify = bool(self.var_verify.get())
+        deep = bool(self.var_deep.get())
+
+        def work():
+            done = 0
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = {ex.submit(probe, it["url"], it["key"], it["model"], timeout,
+                                  verify, deep, self._log, self.stop_event): it for it in items}
+                for fut in concurrent.futures.as_completed(futs):
+                    it = futs[fut]
+                    try:
+                        res = fut.result()
+                    except Exception as e:  # noqa: BLE001
+                        res = {"input": it["url"], "base": it["url"], "verdict":
+                               f"异常: {type(e).__name__}: {e}", "verdict_level": "error",
+                               "ok": False, "models": [], "warnings": []}
+                    done += 1
+                    self.q.put(("batch_row", (res, done, len(items))))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _clear_batch(self):
+        self.tv_batch.delete(*self.tv_batch.get_children())
+        self.batch_rows = []
+
+    # ---------------- 事件泵 ----------------
+    def _pump(self):
+        try:
+            while True:
+                kind, data = self.q.get_nowait()
+                if kind == "log":
+                    self._log_append(str(data))
+                elif kind == "site_done":
+                    self._render_site(data)
+                elif kind == "gen_done":
+                    self._render_generation(data)
+                elif kind == "batch_row":
+                    res, done, total = data
+                    self._append_batch_row(res, done, total)
+                elif kind == "batch_done":
+                    self._finish_batch()
+                elif kind == "fatal":
+                    self._log_append(f"致命错误: {data}")
+                    self._set_status("出错，详见日志")
+                    self._finish_busy()
+        except queue.Empty:
+            pass
+        self.root.after(80, self._pump)
+
+    def _finish_busy(self):
+        self.busy = False
+        self.btn_list.configure(state="normal")
+        self.btn_batch.configure(state="normal")
+        self.btn_gen.configure(state="normal" if self.site_result else "disabled")
+        self.btn_stop.configure(state="disabled")
+
+    # ---------------- 渲染 ----------------
+    def _render_site(self, res: dict):
+        """第 1 步完成：把站点信息铺开，并把推荐模型高亮出来，等人工确认。"""
+        self.site_result = res
+        self.last_result = res
+        self._site_signature = self._signature()
+        self._render_overview(res)
+        self._refresh_models()
+        n = len(res.get("models") or [])
+        self.lbl_models.configure(text=f"共 {n} 个模型")
+        auto = choose_default_model(res.get("models") or [], self.var_model.get().strip())
+        if auto:
+            self._select_model_in_tree(auto)
+        if res.get("ok_site"):
+            self.nb.select(1)
+            self._set_status("第 1 步完成 —— 请选择模型")
+            self.lbl_summary.configure(
+                text=f"第 1 步完成：{n} 个模型（已定位到推荐模型 {auto}）。"
+                     "点「② 对选中模型发测试」或双击某行直接测。")
+        else:
+            self.nb.select(0)
+            self._set_status("第 1 步结束，详见概览")
+            self.lbl_summary.configure(
+                text=f"{res.get('verdict', '')}（可手工在上方「指定模型」填模型名后做第 2 步）")
+        self._log_append(f"=== 第 1 步完成：{res.get('verdict', '')} ===")
+        self._finish_busy()
+
+    def _render_generation(self, res: dict):
+        """第 2 步完成：刷新概览并切回概览页看结论。"""
+        self.site_result = res
+        self.last_result = res
+        self._render_overview(res)
+        self.nb.select(0)
+        self._set_status("第 2 步完成")
+        self.lbl_summary.configure(text=f"{res.get('base', '')} → {res.get('verdict', '')}")
+        self._log_append(f"=== 第 2 步完成：{res.get('verdict', '')} ===")
+        self._finish_busy()
+
+    def _render_overview(self, res: dict):
+        tv = self.tv_ov
+        tv.delete(*tv.get_children())
+
+        def add(item, value, level="info", head=False):
+            tv.insert("", "end", values=(item, value), tags=("head",) if head else (level,))
+
+        add("结论", res.get("verdict", ""), res.get("verdict_level", "info"))
+
+        add("── 第 1 步：站点与模型列表 ──", "", head=True)
+        add("地址（归一化）", res.get("base", ""), "muted")
+        add("协议族", res.get("protocol_label", "未识别"))
+        add("站点指纹", res.get("fingerprint") or "未识别（非 New API/one-api 系或已隐藏）")
+        add("模型数量", str(res.get("model_count", len(res.get("models") or []))))
+        add("模型列表耗时", f"{res.get('models_ms')} ms" if res.get("models_ms") else "-")
+        for lvl, text in res.get("warnings", []):
+            add(LEVEL_LABEL.get(lvl, "·"), text, lvl)
+
+        add("── 第 2 步：生成测试 ──", "", head=True)
+        if not res.get("used_model") and not res.get("gen_error"):
+            add("状态", "尚未执行 —— 在「模型列表」里选一个模型，再点「② 对选中模型发测试」", "muted")
+        else:
+            add("请求模型", res.get("used_model") or "-")
+            got = res.get("returned_model") or "-"
+            same = (res.get("used_model") and res.get("returned_model")
+                    and norm_model(res["used_model"]) == norm_model(res["returned_model"]))
+            add("返回模型", got, "ok" if same else ("risk" if res.get("returned_model") else "muted"))
+            add("首字延迟", f"{res['first_token_ms']:.0f} ms"
+                if res.get("first_token_ms") is not None else "-")
+            add("生成总耗时", f"{res.get('gen_ms')} ms" if res.get("gen_ms") else "-")
+            usage = res.get("usage")
+            if isinstance(usage, dict):
+                add("usage（token）", json.dumps(usage, ensure_ascii=False)[:200])
+            else:
+                add("usage（token）", "未返回", "warn")
+            add("HTTP 状态", str(res.get("http_status") or "-"))
+            if res.get("sample_text"):
+                add("返回内容片段", res["sample_text"].replace("\n", " ")[:160])
+            if res.get("gen_error"):
+                add("生成错误", res["gen_error"], "error")
+            for lvl, text in res.get("gen_warnings", []):
+                add(LEVEL_LABEL.get(lvl, "·"), text, lvl)
+
+    def _refresh_models(self):
+        models = (self.site_result or self.last_result or {}).get("models") or []
+        kw = self.var_filter.get().strip().lower()
+        only_main = bool(self.var_only_main.get())
+        main_set = set(MAINSTREAM_MODELS)
+        tv = self.tv_models
+        tv.delete(*tv.get_children())
+        n = 0
+        for i, m in enumerate(models, 1):
+            mid = m.get("id", "")
+            nm = norm_model(mid)
+            marks = []
+            if nm in main_set:
+                marks.append("主流")
+            low = mid.lower()
+            if any(x in low for x in ("embed", "rerank")):
+                marks.append("向量/重排")
+            elif any(x in low for x in ("tts", "whisper", "audio", "speech")):
+                marks.append("语音")
+            elif any(x in low for x in ("image", "dall-e", "flux", "sd", "video", "sora", "mj")):
+                marks.append("图像/视频")
+            elif any(x in low for x in ("moderation",)):
+                marks.append("审核")
+            if only_main and "主流" not in marks:
+                continue
+            if kw and kw not in mid.lower() and not any(kw in mk.lower() for mk in marks):
+                continue
+            n += 1
+            m["_mark"] = "、".join(marks)
+            tv.insert("", "end", values=(n, mid, m["_mark"], m.get("owner", "")
+                                         or m.get("display", "")))
+        self.lbl_models.configure(text=f"显示 {n} / 共 {len(models)} 个模型")
+
+    def _select_model_in_tree(self, model_id: str) -> None:
+        """在模型列表里定位并选中某个模型（仅高亮，不会自动发测试）。"""
+        for iid in self.tv_models.get_children():
+            if self.tv_models.set(iid, "id") == model_id:
+                self.tv_models.selection_set(iid)
+                self.tv_models.focus(iid)
+                self.tv_models.see(iid)
+                self.var_model.set(model_id)
+                self.lbl_picked.configure(text=model_id)
+                return
+
+    def _on_model_select(self, _evt=None):
+        sel = self.tv_models.selection()
+        if not sel:
+            return
+        mid = self.tv_models.set(sel[0], "id")
+        self.var_model.set(mid)
+        self.lbl_picked.configure(text=mid)
+        if self.site_result and not self.busy:
+            self._set_status(f"已选中 {mid} —— 点「② 对选中模型发测试」或双击该行直接测")
+
+    def _signature(self) -> str:
+        return f"{self.var_url.get().strip()}|{self.var_key.get().strip()}"
+
+    def _on_conn_changed(self, _evt=None):
+        """输入框里的地址/Key 被改动后：结果作废 + 择机落盘。"""
+        self._schedule_save()
+        if self.busy:
+            return
+        if self.site_result and self._signature() != self._site_signature:
+            self._invalidate_results()
+            self._set_status("地址/Key 已变更：请重新点「① 获取模型列表」")
+
+    def _on_model_dclick(self, _evt):
+        sel = self.tv_models.selection()
+        if not sel:
+            return
+        self._on_model_select()
+        self.run_generation()
+
+    def _append_batch_row(self, res: dict, done: int, total: int):
+        row = result_to_row(res)
+        self.batch_rows.append(row)
+        req, got = res.get("used_model", ""), res.get("returned_model", "")
+        arrow = f"{req} → {got}" if (req or got) else ""
+        marks = " ; ".join(x for lvl, x in res.get("warnings", []) if lvl in ("risk", "warn", "error"))
+        self.tv_batch.insert("", "end", tags=(res.get("verdict_level", "info"),), values=(
+            res.get("base") or res.get("input", ""),
+            res.get("protocol_label", ""),
+            res.get("http_status", ""),
+            res.get("models_ms", ""),
+            round(res["first_token_ms"], 1) if res.get("first_token_ms") is not None else "",
+            res.get("model_count", len(res.get("models") or [])),
+            arrow,
+            res.get("fingerprint", ""),
+            res.get("verdict", "") + (f" ｜ {marks}" if marks else ""),
+        ))
+        self._set_status(f"批量进度 {done}/{total}")
+        self.lbl_summary.configure(text=f"批量测试中… {done}/{total}")
+        if done >= total:
+            self._log_append(f"=== 批量测试完成，共 {total} 个 ===")
+            self._set_status(f"批量完成：{total} 个")
+            self._finish_busy()
+
+    def _finish_batch(self):
+        self._finish_busy()
+
+    def _on_batch_dclick(self, _evt):
+        sel = self.tv_batch.selection()
+        if not sel:
+            return
+        vals = self.tv_batch.item(sel[0], "values")
+        if vals:
+            self.var_url.set(vals[0])
+            self.nb.select(0)
+            self._set_status("已把该地址填入上方输入框，可点「开始测试」看详情")
+
+    # ---------------- 导出 ----------------
+    def export_last(self, kind: str):
+        from tkinter import filedialog, messagebox
+        if not self.last_result:
+            self._set_status("还没有测试结果")
+            return
+        res = self.last_result
+        default = f"api_probe_{time.strftime('%Y%m%d_%H%M%S')}.{kind}"
+        path = filedialog.asksaveasfilename(title="导出测试结果", defaultextension=f".{kind}",
+                                            initialfile=default)
+        if not path:
+            return
+        try:
+            if kind == "json":
+                export_json(res, path)
+            else:
+                export_csv([result_to_row(res)], path)
+            self._set_status(f"已导出：{path}")
+            messagebox.showinfo("导出成功", f"已导出到：\n{path}")
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("导出失败", str(e))
+
+    def export_batch(self, kind: str):
+        from tkinter import filedialog, messagebox
+        if not self.batch_rows:
+            self._set_status("批量结果为空")
+            return
+        default = f"api_batch_{time.strftime('%Y%m%d_%H%M%S')}.{kind}"
+        path = filedialog.asksaveasfilename(title="导出批量结果", defaultextension=f".{kind}",
+                                            initialfile=default)
+        if not path:
+            return
+        try:
+            if kind == "json":
+                export_json(self.batch_rows, path)
+            else:
+                export_csv(self.batch_rows, path)
+            self._set_status(f"已导出：{path}")
+            messagebox.showinfo("导出成功", f"已导出到：\n{path}")
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("导出失败", str(e))
+
+    def export_models(self):
+        from tkinter import filedialog, messagebox
+        models = (self.last_result or {}).get("models") or []
+        if not models:
+            self._set_status("模型列表为空")
+            return
+        path = filedialog.asksaveasfilename(title="导出模型列表", defaultextension=".csv",
+                                            initialfile=f"models_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+        if not path:
+            return
+        try:
+            export_csv([{"模型ID": m.get("id", ""), "标记": m.get("_mark", ""),
+                         "归属": m.get("owner", "")} for m in models], path)
+            messagebox.showinfo("导出成功", f"已导出 {len(models)} 个模型到：\n{path}")
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("导出失败", str(e))
+
+
+def enable_dpi_awareness():
+    if sys.platform != "win32":
+        return
+    try:
+        from ctypes import windll
+        try:
+            windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+def run_gui() -> int:
+    import tkinter as tk
+    enable_dpi_awareness()
+    root = tk.Tk()
+    ProbeApp(root)
+    root.mainloop()
+    return 0
+
+
+# =====================================================================
+# 八、自检（本地 mock 服务器，不访问外网）
+# =====================================================================
+
+def _mock_server(mode: str):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
+        def log_message(self, *a):  # 静音
+            pass
+
+        def _send(self, code, obj=None, raw=None, ctype="application/json", extra=None):
+            body = raw if raw is not None else json.dumps(obj, ensure_ascii=False).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            for k, v in (extra or {}).items():
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _path(self):
+            return urllib.parse.urlsplit(self.path)
+
+        def do_GET(self):  # noqa: N802
+            u = self._path()
+            path, q = u.path, urllib.parse.parse_qs(u.query)
+            mode_ = self.server.mode  # type: ignore[attr-defined]
+            auth = self.headers.get("Authorization") or ""
+            xkey = self.headers.get("x-goog-api-key") or ""
+            if path == "/api/status":
+                return self._send(200, {"success": True, "data": {
+                    "version": "v0.8.12.3", "system_name": "MockRelay",
+                    "quota_per_unit": 500000, "display_in_currency": True}})
+            if path == "/":
+                return self._send(200, raw=b"<!doctype html><title>MockRelay - New API</title>",
+                                  ctype="text/html; charset=utf-8")
+            if mode_ == "badkey":
+                return self._send(401, {"error": {"message": "无效的令牌 (request id: mock-1)",
+                                                  "type": "new_api_error"}})
+            if path in ("/v1/models", "/models"):
+                if mode_ == "gemini":
+                    # 真 Gemini 原生接口没有 /v1/models，这里如实 404，
+                    # 用来验证「OpenAI 探测失败后会自动切到 Gemini 协议」
+                    return self._send(404, {"error": {"message": "not found"}})
+                if not auth.startswith("Bearer "):
+                    return self._send(401, {"error": {"message": "未提供令牌", "type": "one_api_error"}})
+                return self._send(200, {"object": "list", "data": [
+                    {"id": "gpt-4o", "object": "model", "owned_by": "openai"},
+                    {"id": "gpt-4o-mini-2024-07-18", "object": "model", "owned_by": "openai"},
+                    {"id": "claude-sonnet-4-5-20250929", "object": "model", "owned_by": "anthropic"},
+                    {"id": "deepseek-chat", "object": "model", "owned_by": "deepseek"},
+                    {"id": "text-embedding-3-small", "object": "model", "owned_by": "openai"}]})
+            if path == "/v1beta/models":
+                if xkey != "sk-mock" and q.get("key", [""])[0] != "sk-mock":
+                    return self._send(403, {"error": {"message": "API key not valid"}})
+                return self._send(200, {"models": [
+                    {"name": "models/gemini-2.5-pro", "displayName": "Gemini 2.5 Pro"},
+                    {"name": "models/gemini-2.5-flash", "displayName": "Gemini 2.5 Flash"}]})
+            return self._send(404, {"error": {"message": "not found"}})
+
+        def do_POST(self):  # noqa: N802
+            u = self._path()
+            path = u.path
+            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                payload = json.loads(self.rfile.read(length) or b"{}")
+            except Exception:
+                payload = {}
+            if path == "/v1/chat/completions":
+                model = (payload or {}).get("model", "gpt-4o")
+                # 故意返回一个不同的模型名，用于验证「掺水/映射」告警
+                fake = "gpt-4o-mini" if model != "gpt-4o-mini" else "gpt-4o"
+                if payload.get("stream"):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.end_headers()
+                    chunks = [
+                        {"id": "chatcmpl-mock", "object": "chat.completion.chunk", "model": fake,
+                         "choices": [{"index": 0, "delta": {"role": "assistant", "content": "OK"},
+                                      "finish_reason": None}]},
+                        {"id": "chatcmpl-mock", "object": "chat.completion.chunk", "model": fake,
+                         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                         "usage": {"prompt_tokens": 9, "completion_tokens": 1, "total_tokens": 10}},
+                    ]
+                    for c in chunks:
+                        self.wfile.write(f"data: {json.dumps(c)}\n\n".encode())
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    return
+                return self._send(200, {"id": "chatcmpl-mock", "object": "chat.completion",
+                                        "model": fake,
+                                        "choices": [{"index": 0, "finish_reason": "stop",
+                                                     "message": {"role": "assistant", "content": "OK"}}],
+                                        "usage": {"prompt_tokens": 9, "completion_tokens": 1,
+                                                  "total_tokens": 10}})
+            if path == "/v1/messages":
+                if not self.headers.get("x-api-key"):
+                    return self._send(401, {"type": "error", "error": {
+                        "type": "authentication_error", "message": "invalid x-api-key"}})
+                if payload.get("stream"):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.end_headers()
+                    evs = [
+                        ("message_start", {"type": "message_start", "message": {
+                            "id": "msg_mock", "model": "claude-sonnet-4-5", "usage": {"input_tokens": 8}}}),
+                        ("content_block_delta", {"type": "content_block_delta",
+                                                 "delta": {"type": "text_delta", "text": "OK"}}),
+                        ("message_delta", {"type": "message_delta",
+                                           "usage": {"output_tokens": 1}}),
+                    ]
+                    for name, obj in evs:
+                        self.wfile.write(f"event: {name}\ndata: {json.dumps(obj)}\n\n".encode())
+                    return
+                return self._send(200, {"id": "msg_mock", "type": "message", "role": "assistant",
+                                        "model": "claude-sonnet-4-5",
+                                        "content": [{"type": "text", "text": "OK"}],
+                                        "usage": {"input_tokens": 8, "output_tokens": 1}})
+            return self._send(404, {"error": {"message": "not found"}})
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    srv.mode = mode  # type: ignore[attr-defined]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, f"http://127.0.0.1:{srv.server_address[1]}"
+
+
+def selftest() -> int:
+    ok_count, fail_count = 0, 0
+
+    def check(name, cond, extra=""):
+        nonlocal ok_count, fail_count
+        if cond:
+            ok_count += 1
+            print(f"  [PASS] {name}")
+        else:
+            fail_count += 1
+            print(f"  [FAIL] {name} {extra}")
+
+    print(f"{APP_NAME} v{APP_VERSION} 自检\n")
+
+    print("[1] URL 归一化")
+    cases = [
+        ("api.openai.com", "https://api.openai.com"),
+        ("https://x.com/v1/chat/completions", "https://x.com"),
+        ("https://x.com/v1/", "https://x.com"),
+        ("https://openrouter.ai/api/v1", "https://openrouter.ai/api"),
+        ("https://x.com/v1beta/models", "https://x.com"),
+        ("https://x.com/proxy/v1/messages", "https://x.com/proxy"),
+        ("http://127.0.0.1:3000/v1", "http://127.0.0.1:3000"),
+    ]
+    for raw, want in cases:
+        got = normalize_base(raw)
+        check(f"normalize_base({raw!r}) == {want!r}", got == want, f"-> {got!r}")
+
+    print("\n[2] 模型名归一化")
+    mcases = [("gpt-4o-2024-08-06", "gpt-4o"), ("claude-sonnet-4-5-20250929", "claude-sonnet-4-5"),
+              ("openai/gpt-4o", "gpt-4o"), ("models/gemini-2.5-pro", "gemini-2-5-pro"),
+              ("deepseek-chat", "deepseek-chat")]
+    for raw, want in mcases:
+        got = norm_model(raw)
+        check(f"norm_model({raw!r}) == {want!r}", got == want, f"-> {got!r}")
+
+    print("\n[2b] 默认模型挑选（回归：不要选 :batch / embedding）")
+    fake = [{"id": x} for x in ["openai/gpt-4o:batch", "openai/gpt-4o",
+                                "text-embedding-3-large", "openai/gpt-4o-mini"]]
+    picked = choose_default_model(fake)
+    check("避开 :batch 与 embedding", picked == "openai/gpt-4o", f"-> {picked}")
+    picked2 = choose_default_model(fake, "gpt-4o-mini")
+    check("用户指定模型优先命中", picked2 == "openai/gpt-4o-mini", f"-> {picked2}")
+    check("用户指定的模型不在列表时原样保留",
+          choose_default_model(fake, "my-custom-model") == "my-custom-model")
+
+    print("\n[3] 批量行解析")
+    items = parse_batch_lines("https://a.com | sk-1 | gpt-4o\n#注释\nhttps://b.com,sk-2\n\nhttps://c.com")
+    check("解析出 3 条", len(items) == 3, f"-> {items}")
+    check("第一条含模型", items and items[0]["model"] == "gpt-4o", f"-> {items[0] if items else None}")
+    check("第三条只有 URL", items and items[2]["key"] == "")
+
+    print("\n[4] mock 站点：OpenAI 兼容 + 掺水告警")
+    srv, base = _mock_server("openai")
+    try:
+        res = probe(base, "sk-mock", timeout=10, deep=True)
+        check("识别为 OpenAI 兼容", res["protocol"] == "openai", f"-> {res['protocol']}")
+        check("模型数 == 5", res["model_count"] == 5, f"-> {res['model_count']}")
+        check("识别为可用", res["ok"] is True, f"-> {res['verdict']}")
+        check("流式拿到首字", res["first_token_ms"] is not None)
+        check("返回模型被解析", res["returned_model"] == "gpt-4o-mini", f"-> {res['returned_model']}")
+        check("触发模型不一致告警", any(lvl == "risk" for lvl, _ in res["gen_warnings"]),
+              f"-> {res['gen_warnings']}")
+        check("指纹识别 MockRelay", "MockRelay" in (res["fingerprint"] or ""), f"-> {res['fingerprint']}")
+        check("usage 被解析", isinstance(res["usage"], dict) and res["usage"].get("total_tokens") == 10,
+              f"-> {res['usage']}")
+    finally:
+        srv.shutdown()
+
+    print("\n[4b] 两段式：先拉列表 → 人工选模型 → 再生成测试")
+    srv, base = _mock_server("openai")
+    try:
+        site = probe_site(base, "sk-mock", timeout=10)
+        check("第 1 步识别协议", site["protocol"] == "openai", f"-> {site['protocol']}")
+        check("第 1 步拿到 5 个模型", site["model_count"] == 5, f"-> {site['model_count']}")
+        check("第 1 步判定站点可达", site["ok_site"] is True)
+        check("第 1 步不发生成请求", site["ok"] is False and site["first_token_ms"] is None)
+        pick = "claude-sonnet-4-5-20250929"          # 模拟人工从列表里挑一个
+        gen = probe_generate(site, "sk-mock", pick, timeout=10, deep=True)
+        check("第 2 步用人工选定的模型", gen["used_model"] == pick, f"-> {gen['used_model']}")
+        check("第 2 步拿到首字延迟", gen["first_token_ms"] is not None)
+        check("第 2 步判定可用", gen["ok"] is True, f"-> {gen['verdict']}")
+        gen2 = probe_generate(site, "sk-mock", "gpt-4o", timeout=10, deep=False)
+        check("换模型重测仍是可用", gen2["used_model"] == "gpt-4o" and gen2["ok"] is True)
+        check("换模型重测不累积旧结论",
+              len([1 for lvl, _ in gen2["gen_warnings"] if lvl == "risk"]) == 1,
+              f"-> {gen2['gen_warnings']}")
+        check("第 1 步结论仍在（未被覆盖）",
+              "第 1 步完成" in (gen2.get("verdict") or "") or bool(gen2.get("models")),
+              f"-> {gen2.get('verdict')}")
+    finally:
+        srv.shutdown()
+
+    print("\n[5] mock 站点：Gemini 协议")
+    srv, base = _mock_server("gemini")
+    try:
+        res = probe(base, "sk-mock", timeout=10, deep=False)
+        check("识别为 Gemini", res["protocol"] == "gemini", f"-> {res['protocol']}")
+        check("模型数 == 2", res["model_count"] == 2, f"-> {res['model_count']}")
+    finally:
+        srv.shutdown()
+
+    print("\n[6] mock 站点：Key 无效")
+    srv, base = _mock_server("badkey")
+    try:
+        res = probe(base, "sk-bad", timeout=10)
+        check("判定为不可用", res["ok"] is False)
+        check("错误信息包含『无效的令牌』",
+              "无效的令牌" in json.dumps(res["warnings"], ensure_ascii=False),
+              f"-> {res['warnings']}")
+    finally:
+        srv.shutdown()
+
+    print("\n[7] 不可达地址（应优雅失败，不抛异常）")
+    res = probe("http://127.0.0.1:9/v1", "sk-x", timeout=3)
+    check("返回结论而非异常", bool(res["verdict"]), f"-> {res['verdict']}")
+    check("ok 为 False", res["ok"] is False)
+
+    print("\n[8] 导出 CSV / JSON")
+    import tempfile
+    srv, base = _mock_server("openai")
+    try:
+        res = probe(base, "sk-mock", timeout=10, deep=False)
+        with tempfile.TemporaryDirectory() as td:
+            pj = os.path.join(td, "r.json")
+            pc = os.path.join(td, "r.csv")
+            export_json(res, pj)
+            export_csv([result_to_row(res)], pc)
+            data = json.loads(Path(pj).read_text(encoding="utf-8"))
+            check("JSON 可回读且结论一致", data.get("verdict") == res["verdict"],
+                  f"-> {data.get('verdict')!r}")
+            txt = Path(pc).read_text(encoding="utf-8-sig")
+            head, _, rest = txt.partition("\n")
+            check("CSV 表头含关键列", "结论" in head and "首字延迟ms" in head, f"-> {head[:80]}")
+            check("CSV 含站点地址", "127.0.0.1" in rest)
+    finally:
+        srv.shutdown()
+
+    print("\n[9] 敏感信息保存（本机加密）")
+    avail = dpapi_available()
+    print(f"  本机加密能力（Windows DPAPI）: {'可用' if avail else '不可用'}")
+    secret = "sk-test-abcdef1234567890"
+    blob, enc = encode_secret(secret)
+    check("编码结果非空", bool(blob))
+    check("加密标记与实际能力一致", enc is avail, f"-> enc={enc} avail={avail}")
+    check("能原样解回来", decode_secret(blob, enc) == secret,
+          f"-> {decode_secret(blob, enc)!r}")
+    if avail:
+        check("存盘内容里没有明文 Key", secret not in blob, f"-> {blob[:36]}...")
+    check("空值不炸", encode_secret("")[0] == "" and decode_secret("", True) == "")
+    check("坏数据不炸（返回空串）", decode_secret("!!!not-base64!!!", True) == "")
+    check("向后兼容旧的明文配置",
+          decode_secret("sk-plain-old", False) == "sk-plain-old")
+
+    print(f"\n结果：{ok_count} 通过 / {fail_count} 失败")
+    return 1 if fail_count else 0
+
+
+def uitest() -> int:
+    """界面自检：构建控件 + 用本地 mock 跑一遍「拉列表 → 人工挑模型 → 发测试」的完整流程，
+    再验证配置持久化（URL 明文、Key 加密、重启恢复）。
+
+    注意：整个过程把 CONFIG_PATH 指向临时目录，绝不碰用户真实的 ~/.api_probe.json。
+    """
+    import tkinter as tk
+    import tempfile
+    global CONFIG_PATH
+
+    real_config_path = CONFIG_PATH
+    CONFIG_PATH = Path(tempfile.mkdtemp(prefix="api_probe_cfg_")) / "cfg.json"
+
+    enable_dpi_awareness()
+    fails = []
+
+    def check(name, cond, extra=""):
+        if cond:
+            print(f"  [PASS] {name}")
+        else:
+            fails.append(name)
+            print(f"  [FAIL] {name} {extra}")
+
+    def wait_until(pred, root, timeout=20.0):
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            root.update()
+            if pred():
+                return True
+            time.sleep(0.05)
+        root.update()
+        return pred()
+
+    srv, base = _mock_server("openai")
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        app = ProbeApp(root)
+        root.update()
+        check("界面构建成功", True)
+
+        # ---- 第 1 步：拉模型列表 ----
+        app.var_url.set(base)
+        app.var_key.set("sk-mock")
+        app.var_deep.set(False)
+        app.fetch_models()
+        check("第 1 步进入忙碌态", app.busy is True)
+        ok = wait_until(lambda: app.site_result is not None and not app.busy, root)
+        check("第 1 步完成且回到空闲", ok)
+        check("第 1 步拿到 5 个模型",
+              (app.site_result or {}).get("model_count") == 5,
+              f"-> {(app.site_result or {}).get('model_count')}")
+        check("第 1 步没有发生成请求",
+              (app.site_result or {}).get("first_token_ms") is None)
+        check("模型列表已填进表格", len(app.tv_models.get_children()) == 5,
+              f"-> {len(app.tv_models.get_children())} 行")
+        check("第 2 步按钮已启用", str(app.btn_gen["state"]) == "normal",
+              f"-> {app.btn_gen['state']}")
+        check("自动切到模型列表页", app.nb.index(app.nb.select()) == 1)
+
+        # ---- 人工挑一个模型（模拟点击列表里的另一行）----
+        pick = "deepseek-chat"
+        app._select_model_in_tree(pick)
+        root.update()
+        check("选中后写入指定模型框", app.var_model.get() == pick, f"-> {app.var_model.get()}")
+        check("界面显示当前选中", pick in app.lbl_picked.cget("text"))
+
+        # ---- 第 2 步：发测试 ----
+        app.run_generation()
+        ok = wait_until(lambda: not app.busy, root)
+        check("第 2 步完成", ok)
+        res = app.last_result or {}
+        check("测试用的正是人工选的那个模型", res.get("used_model") == pick,
+              f"-> {res.get('used_model')}")
+        check("第 2 步拿到首字延迟", res.get("first_token_ms") is not None)
+        check("第 2 步判定可用", res.get("ok") is True, f"-> {res.get('verdict')}")
+        check("第 1 步信息仍保留", res.get("model_count") == 5)
+
+        items = [app.tv_ov.set(i, "item") for i in app.tv_ov.get_children()]
+        check("概览含第 1 步分区", any("第 1 步" in i for i in items))
+        check("概览含第 2 步分区", any("第 2 步" in i for i in items))
+        check("概览记录了请求/返回模型",
+              any(i == "请求模型" for i in items) and any(i == "返回模型" for i in items))
+        check("测试完切回概览页", app.nb.index(app.nb.select()) == 0)
+
+        # ---- 换一个模型重测：不应污染第 1 步信息 ----
+        app.var_model.set("gpt-4o")
+        app.run_generation()
+        wait_until(lambda: not app.busy, root)
+        res2 = app.last_result or {}
+        check("换模型重测 ok", res2.get("used_model") == "gpt-4o" and res2.get("ok") is True)
+        check("重测后模型列表仍在", res2.get("model_count") == 5)
+
+        # ---- 改地址应让第 1 步结果作废 ----
+        app.var_url.set(base + "/other")
+        app._on_conn_changed()
+        check("地址变更后第 2 步按钮被禁用", str(app.btn_gen["state"]) == "disabled",
+              f"-> {app.btn_gen['state']}")
+        check("地址变更后结果已清空", app.site_result is None)
+
+        # ---- 配置持久化：URL 明文存、Key 加密存、重启后能恢复 ----
+        try:
+            app.var_url.set(base)
+            app.var_key.set("sk-mock-secret-123456")
+            app.var_model.set("gpt-4o")
+            app.var_remember.set(True)
+            app.txt_batch.delete("1.0", "end")
+            app.txt_batch.insert("1.0", "https://a.example | sk-batch-key | gpt-4o\n")
+            app._save_config()
+            check("配置已写入磁盘", CONFIG_PATH.exists(), f"-> {CONFIG_PATH}")
+            raw = CONFIG_PATH.read_text(encoding="utf-8")
+            saved = json.loads(raw)
+            check("URL 明文保存", saved.get("url") == base, f"-> {saved.get('url')}")
+            check("配置文件里找不到明文 Key", "sk-mock-secret-123456" not in raw)
+            check("配置文件里找不到批量明文 Key", "sk-batch-key" not in raw)
+            check("加密标记与实际能力一致",
+                  bool(saved.get("key_encrypted")) is dpapi_available())
+
+            root2 = tk.Tk()
+            root2.withdraw()
+            app2 = ProbeApp(root2)
+            check("重启后恢复 URL", app2.var_url.get() == base, f"-> {app2.var_url.get()}")
+            check("重启后恢复 Key", app2.var_key.get() == "sk-mock-secret-123456",
+                  f"-> {app2.var_key.get()!r}")
+            check("重启后恢复勾选与指定模型",
+                  bool(app2.var_remember.get()) and app2.var_model.get() == "gpt-4o")
+            check("重启后恢复批量列表",
+                  "sk-batch-key" in app2.txt_batch.get("1.0", "end-1c"))
+            check("重启后恢复界面开关（TLS 校验）", bool(app2.var_verify.get()) is True)
+
+            app2.var_remember.set(False)
+            app2._on_remember_toggle()
+            saved2 = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            check("取消「记住 Key」后文件中的 Key 被清空", saved2.get("key") == "",
+                  f"-> {saved2.get('key')!r}")
+            root2.destroy()
+        finally:
+            pass
+
+        # ---- 站点管理：多个中转站互相切换（含用户反馈的「切回自定义不还原」）----
+        app.var_remember.set(True)
+        app.var_site.set(ADHOC_SITE)
+        app._active_site = ADHOC_SITE
+        app.var_url.set("https://my-own-relay.example/v1")   # 先在「自定义」格里放一个地址
+        app.var_key.set("sk-adhoc-key")
+        app.var_model.set("gpt-4o")
+        app._stash_current_fields()
+
+        ok_a = app._add_site_record("Kimi 官方", "https://api.moonshot.cn/v1",
+                                    "sk-kimi-123", "kimi-k2")
+        ok_b = app._add_site_record("cn2 中转", "https://cn2.api2cn.com",
+                                    "sk-cn2-456", "claude-sonnet-5-5")
+        check("能连续添加两个站点", ok_a and ok_b and len(app.sites) == 2,
+              f"-> a={ok_a} b={ok_b} n={len(app.sites)}")
+        check("重复名字不允许添加", app._add_site_record("Kimi 官方", "https://x.com") is False)
+        check("添加后自动选中新站点", app.var_site.get() == "cn2 中转", f"-> {app.var_site.get()}")
+        check("切换站点后地址跟着变", app.var_url.get() == "https://cn2.api2cn.com",
+              f"-> {app.var_url.get()}")
+        check("切换站点后 Key 跟着变", app.var_key.get() == "sk-cn2-456")
+        check("切换站点后默认模型跟着变", app.var_model.get() == "claude-sonnet-5-5")
+        check("下拉里是 自定义 + 2 个站点", len(list(app.cmb_site.cget("values"))) == 3,
+              f"-> {app.cmb_site.cget('values')}")
+
+        app._select_site("Kimi 官方")
+        check("切到 Kimi 站地址正确", app.var_url.get() == "https://api.moonshot.cn/v1",
+              f"-> {app.var_url.get()}")
+        check("切到 Kimi 站 Key 正确", app.var_key.get() == "sk-kimi-123")
+
+        # 用户报的 bug 场景：切到别的站点后，再切回「自定义」必须还原自定义那一格
+        app._select_site(ADHOC_SITE)
+        check("切回「自定义」还原自定义地址",
+              app.var_url.get() == "https://my-own-relay.example/v1", f"-> {app.var_url.get()}")
+        check("切回「自定义」还原自定义 Key", app.var_key.get() == "sk-adhoc-key")
+        check("切回「自定义」还原自定义模型", app.var_model.get() == "gpt-4o")
+
+        app._select_site("Kimi 官方")
+        app._select_site(ADHOC_SITE)
+        check("来回切换后自定义格还是原值",
+              app.var_url.get() == "https://my-own-relay.example/v1"
+              and app.var_key.get() == "sk-adhoc-key")
+
+        # 在站点里改了内容，切走再切回要保住
+        app._select_site("Kimi 官方")
+        app.var_url.set("https://api.moonshot.cn/v1/")
+        app._stash_current_fields()
+        app._select_site("cn2 中转")
+        app._select_site("Kimi 官方")
+        check("站点内的编辑会被记住", app.var_url.get() == "https://api.moonshot.cn/v1/",
+              f"-> {app.var_url.get()}")
+
+        # 落盘 + 加密 + 重启恢复
+        app._save_config()
+        raw3 = CONFIG_PATH.read_text(encoding="utf-8")
+        cfg3 = json.loads(raw3)
+        check("配置文件里存了两个站点",
+              [s["name"] for s in cfg3.get("sites", [])] == ["Kimi 官方", "cn2 中转"],
+              f"-> {[s['name'] for s in cfg3.get('sites', [])]}")
+        check("站点的默认模型也存了", cfg3["sites"][1].get("model") == "claude-sonnet-5-5")
+        check("站点地址明文保存", cfg3["sites"][1].get("url") == "https://cn2.api2cn.com")
+        check("站点 Key 不以明文出现",
+              "sk-kimi-123" not in raw3 and "sk-cn2-456" not in raw3)
+
+        root3 = tk.Tk()
+        root3.withdraw()
+        app3 = ProbeApp(root3)
+        check("重启后站点列表还在",
+              [s["name"] for s in app3.sites] == ["Kimi 官方", "cn2 中转"],
+              f"-> {[s['name'] for s in app3.sites]}")
+        check("重启后仍停在原来的站点", app3.var_site.get() == "Kimi 官方",
+              f"-> {app3.var_site.get()}")
+        check("重启后站点 Key 自动带出", app3.var_key.get() == "sk-kimi-123",
+              f"-> {app3.var_key.get()!r}")
+        app3._select_site(ADHOC_SITE)
+        check("重启后「自定义」格也还原",
+              app3.var_url.get() == "https://my-own-relay.example/v1",
+              f"-> {app3.var_url.get()}")
+        app3._select_site("cn2 中转")
+        check("重启后切站点 Key 正确", app3.var_key.get() == "sk-cn2-456")
+
+        app3.import_sites_to_batch()
+        bt = app3.txt_batch.get("1.0", "end-1c")
+        check("批量列表能一键导入所有站点",
+              "cn2.api2cn.com" in bt and "api.moonshot.cn" in bt, f"-> {bt!r}")
+        check("导入的批量行带上了 Key", "sk-cn2-456" in bt)
+
+        check("重命名站点",
+              app3._update_site_record("cn2 中转", "cn2-新名", "https://cn2.api2cn.com",
+                                       "sk-cn2-456", "claude-sonnet-5-5") is True)
+        check("重命名后下拉同步", "cn2-新名" in list(app3.cmb_site.cget("values")),
+              f"-> {app3.cmb_site.cget('values')}")
+
+        app3._select_site("Kimi 官方")
+        check("删除站点成功", app3._delete_site_record("Kimi 官方") is True)
+        check("删掉当前站点后回落到「自定义」", app3.var_site.get() == ADHOC_SITE,
+              f"-> {app3.var_site.get()}")
+        check("删除后只剩一个站点", len(app3.sites) == 1, f"-> {len(app3.sites)}")
+        root3.destroy()
+    except Exception as e:  # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+        fails.append(f"异常: {e}")
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+        srv.shutdown()
+        CONFIG_PATH = real_config_path
+
+    if fails:
+        print(f"界面流程自检失败 {len(fails)} 项：{fails}")
+        return 1
+    print("  [PASS] 界面两段式流程全部通过")
+    return 0
+
+
+# =====================================================================
+# 九、命令行
+# =====================================================================
+
+def cli_probe(args) -> int:
+    def log(msg):
+        if not args.json:
+            print(msg)
+
+    if args.list_only:
+        res = probe_site(args.url, args.key, timeout=args.timeout,
+                         verify=not args.no_verify, log=log)
+        if args.json:
+            print(json.dumps({"base": res["base"], "protocol": res["protocol_label"],
+                              "fingerprint": res["fingerprint"],
+                              "model_count": res["model_count"],
+                              "verdict": res["verdict"],
+                              "models": [m["id"] for m in res["models"]]},
+                             ensure_ascii=False, indent=2))
+        else:
+            print()
+            print(f"结论        : {res['verdict']}")
+            print(f"归一化地址  : {res['base']}")
+            print(f"协议族      : {res['protocol_label']}")
+            print(f"站点指纹    : {res['fingerprint'] or '-'}")
+            print(f"模型数量    : {res['model_count']}")
+            print("\n模型列表：")
+            for m in res["models"]:
+                print(f"  - {m['id']}" + (f"   [{m['owner']}]" if m.get("owner") else ""))
+            print("\n下一步：挑一个模型，加 --model 再跑一次即可做生成测试。")
+        return 0 if res.get("ok_site") else 2
+
+    res = probe(args.url, args.key, model=args.model or "", timeout=args.timeout,
+                verify=not args.no_verify, deep=not args.no_deep, log=log)
+    if args.json:
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        return 0 if res.get("ok") else 2
+    print()
+    print(f"结论        : {res['verdict']}")
+    print(f"归一化地址  : {res['base']}")
+    print(f"协议族      : {res['protocol_label']}")
+    print(f"站点指纹    : {res['fingerprint'] or '-'}")
+    print(f"HTTP 状态   : {res['http_status']}")
+    print(f"模型数量    : {res.get('model_count', 0)}")
+    print(f"请求模型    : {res['used_model']}")
+    print(f"返回模型    : {res['returned_model'] or '-'}")
+    ft = res.get("first_token_ms")
+    print(f"首字延迟    : {ft:.0f} ms" if ft is not None else "首字延迟    : -")
+    print(f"usage       : {json.dumps(res['usage'], ensure_ascii=False) if res.get('usage') else '-'}")
+    if args.show_models and res.get("models"):
+        print("\n模型列表：")
+        for m in res["models"]:
+            print(f"  - {m['id']}" + (f"   [{m['owner']}]" if m.get("owner") else ""))
+    print("\n检查项：")
+    for lvl, text in res.get("warnings", []):
+        print(f"  [{lvl:5}] {text}")
+    return 0 if res.get("ok") else 2
+
+
+def _fix_console_encoding() -> None:
+    """让 Windows 控制台/管道输出中文不乱码。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+        except Exception:
+            pass
+
+
+def main(argv=None) -> int:
+    _fix_console_encoding()
+    ap = argparse.ArgumentParser(description=f"{APP_NAME} v{APP_VERSION}",
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--url", help="API 地址（可含 /v1 等后缀）")
+    ap.add_argument("--key", default="", help="API Key")
+    ap.add_argument("--model", default="", help="指定用于生成测试的模型")
+    ap.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
+    ap.add_argument("--no-verify", action="store_true", help="跳过 TLS 证书校验")
+    ap.add_argument("--no-deep", action="store_true", help="关闭深度检测（少发一次请求）")
+    ap.add_argument("--json", action="store_true", help="以 JSON 输出结果")
+    ap.add_argument("--show-models", action="store_true", help="打印完整模型列表")
+    ap.add_argument("--list-only", action="store_true",
+                    help="只做第 1 步：拉取模型列表后退出（不做生成测试）")
+    ap.add_argument("--selftest", action="store_true", help="运行内置自检")
+    ap.add_argument("--uitest", action="store_true", help="运行图形界面构建自检")
+    args = ap.parse_args(argv)
+
+    if args.selftest:
+        return selftest()
+    if args.uitest:
+        return uitest()
+    if args.url:
+        return cli_probe(args)
+    try:
+        return run_gui()
+    except Exception as e:  # noqa: BLE001
+        print(f"无法启动图形界面：{e}\n可改用命令行：python api_probe.py --url URL --key KEY", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
