@@ -75,6 +75,10 @@ Claude Code 接入细节
     python api_probe.py --selftest               # 核心逻辑自检（本地 mock，不访问外网）
     python api_probe.py --uitest                 # 界面 + 站点管理 + 两段式 + 接入页自检
 
+许可证
+------
+    MIT（见仓库根目录 LICENSE）。可自由使用/修改/再发布，保留版权声明与许可证原文即可。
+
 作者说明：本工具只做「客户端主动探测」，不代理、不存储任何请求内容。
 """
 

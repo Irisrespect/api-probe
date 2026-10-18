@@ -561,6 +561,7 @@ python api_probe.py --url https://your-relay.com/v1 --key sk-xxx --list-only --j
 | `自检.bat` | 跑 159 项核心逻辑自检（纯 ASCII）；界面/流程自检用 `python api_probe.py --uitest`（127 项） |
 | `打包exe.bat` | 用 PyInstaller 打成单文件 exe（纯 ASCII） |
 | `README.md` | 本文档 |
+| `LICENSE` | MIT 许可证 |
 
 运行时另外会产生（都在用户目录，不在本仓库）：
 
@@ -573,3 +574,18 @@ python api_probe.py --url https://your-relay.com/v1 --key sk-xxx --list-only --j
 | `~/.api_probe/claude-code-<站点>/`、`~/.api_probe/codex-<站点>/` | 生成的启动脚本与隔离配置目录 |
 
 版本 v1.7.0（一个站点可存多把 Key，各带格式标签；Claude Code 与 Codex 两页各自认领对应格式的 Key）
+
+---
+
+## 13. 许可证
+
+本项目以 **MIT 许可证**发布，见 [LICENSE](LICENSE)。简单说：你可以自由使用、修改、再发布，
+甚至可以商用，只要保留版权声明与许可证原文即可；软件按"现状"提供，不附带任何担保。
+
+几点说明：
+
+- 本工具**只用 Python 标准库**，没有捆绑任何第三方库，所以 MIT 用起来很干净
+- 打包成 exe 用的 PyInstaller 是 **GPL + 启动器例外条款**，该例外允许你用任意许可证发布打包后的程序，
+  不影响本项目以 MIT 分发（目标机器上也不需要装 PyInstaller）
+- 工具产出的**配置文件（`~/.api_probe.json` 等）属于你自己的数据**，与本许可证无关
+- 请自行确保对目标中转站的使用符合其服务条款与当地法规
