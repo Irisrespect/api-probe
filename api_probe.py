@@ -4193,15 +4193,15 @@ def uitest() -> int:
 
         ok_a = app._add_site_record("Kimi 官方", "https://api.moonshot.cn/v1",
                                     "sk-kimi-123", "kimi-k2")
-        ok_b = app._add_site_record("cn2 中转", "https://relay.example.com",
-                                    "sk-cn2-456", "claude-sonnet-5-5")
+        ok_b = app._add_site_record("中转站B", "https://relay.example.com",
+                                    "sk-siteb-456", "claude-sonnet-5-5")
         check("能连续添加两个站点", ok_a and ok_b and len(app.sites) == 2,
               f"-> a={ok_a} b={ok_b} n={len(app.sites)}")
         check("重复名字不允许添加", app._add_site_record("Kimi 官方", "https://x.com") is False)
-        check("添加后自动选中新站点", app.var_site.get() == "cn2 中转", f"-> {app.var_site.get()}")
+        check("添加后自动选中新站点", app.var_site.get() == "中转站B", f"-> {app.var_site.get()}")
         check("切换站点后地址跟着变", app.var_url.get() == "https://relay.example.com",
               f"-> {app.var_url.get()}")
-        check("切换站点后 Key 跟着变", app.var_key.get() == "sk-cn2-456")
+        check("切换站点后 Key 跟着变", app.var_key.get() == "sk-siteb-456")
         check("切换站点后默认模型跟着变", app.var_model.get() == "claude-sonnet-5-5")
         check("下拉里是 自定义 + 2 个站点", len(list(app.cmb_site.cget("values"))) == 3,
               f"-> {app.cmb_site.cget('values')}")
@@ -4228,7 +4228,7 @@ def uitest() -> int:
         app._select_site("Kimi 官方")
         app.var_url.set("https://api.moonshot.cn/v1/")
         app._stash_current_fields()
-        app._select_site("cn2 中转")
+        app._select_site("中转站B")
         app._select_site("Kimi 官方")
         check("站点内的编辑会被记住", app.var_url.get() == "https://api.moonshot.cn/v1/",
               f"-> {app.var_url.get()}")
@@ -4238,18 +4238,18 @@ def uitest() -> int:
         raw3 = CONFIG_PATH.read_text(encoding="utf-8")
         cfg3 = json.loads(raw3)
         check("配置文件里存了两个站点",
-              [s["name"] for s in cfg3.get("sites", [])] == ["Kimi 官方", "cn2 中转"],
+              [s["name"] for s in cfg3.get("sites", [])] == ["Kimi 官方", "中转站B"],
               f"-> {[s['name'] for s in cfg3.get('sites', [])]}")
         check("站点的默认模型也存了", cfg3["sites"][1].get("model") == "claude-sonnet-5-5")
         check("站点地址明文保存", cfg3["sites"][1].get("url") == "https://relay.example.com")
         check("站点 Key 不以明文出现",
-              "sk-kimi-123" not in raw3 and "sk-cn2-456" not in raw3)
+              "sk-kimi-123" not in raw3 and "sk-siteb-456" not in raw3)
 
         root3 = tk.Tk()
         root3.withdraw()
         app3 = ProbeApp(root3)
         check("重启后站点列表还在",
-              [s["name"] for s in app3.sites] == ["Kimi 官方", "cn2 中转"],
+              [s["name"] for s in app3.sites] == ["Kimi 官方", "中转站B"],
               f"-> {[s['name'] for s in app3.sites]}")
         check("重启后仍停在原来的站点", app3.var_site.get() == "Kimi 官方",
               f"-> {app3.var_site.get()}")
@@ -4259,19 +4259,19 @@ def uitest() -> int:
         check("重启后「自定义」格也还原",
               app3.var_url.get() == "https://my-own-relay.example/v1",
               f"-> {app3.var_url.get()}")
-        app3._select_site("cn2 中转")
-        check("重启后切站点 Key 正确", app3.var_key.get() == "sk-cn2-456")
+        app3._select_site("中转站B")
+        check("重启后切站点 Key 正确", app3.var_key.get() == "sk-siteb-456")
 
         app3.import_sites_to_batch()
         bt = app3.txt_batch.get("1.0", "end-1c")
         check("批量列表能一键导入所有站点",
               "relay.example.com" in bt and "api.moonshot.cn" in bt, f"-> {bt!r}")
-        check("导入的批量行带上了 Key", "sk-cn2-456" in bt)
+        check("导入的批量行带上了 Key", "sk-siteb-456" in bt)
 
         check("重命名站点",
-              app3._update_site_record("cn2 中转", "cn2-新名", "https://relay.example.com",
-                                       "sk-cn2-456", "claude-sonnet-5-5") is True)
-        check("重命名后下拉同步", "cn2-新名" in list(app3.cmb_site.cget("values")),
+              app3._update_site_record("中转站B", "B-改名", "https://relay.example.com",
+                                       "sk-siteb-456", "claude-sonnet-5-5") is True)
+        check("重命名后下拉同步", "B-改名" in list(app3.cmb_site.cget("values")),
               f"-> {app3.cmb_site.cget('values')}")
 
         app3._select_site("Kimi 官方")
