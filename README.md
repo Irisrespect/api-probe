@@ -1,6 +1,6 @@
-# API 中转站测活工具（api-probe） v1.8.0
+# API 中转站测活工具（api-probe） v1.9.0
 
-单文件 Windows 桌面小工具，一条线走完：**输入地址+Key → 探测模型 → 测能不能跑得动 → 接入 Claude Code / Codex**。
+单文件 Windows 桌面小工具，一条线走完：**输入地址+Key → 探测模型 → 测能不能跑得动 → 接入 Claude Code / Codex / Grok Build**。
 沿途把「协议族、首字延迟、疑似掺水」等信息摊开给你看。
 
 - 纯 Python 标准库实现（tkinter + urllib），**零第三方依赖**，不需要 `pip install`
@@ -19,10 +19,11 @@
 | 6 | 批量巡检 | 一次跑一堆站点（多 Key 的站点每把各一行），并发可调，导出 CSV/JSON 做横向对比 |
 | 7 | 持久化与安全 | 站点信息明文存、每把 Key 用 Windows DPAPI 按用户加密，可一键清除 |
 | 8 | 命令行/自动化 | `--list-only` / `--model` / `--json`，退出码 0/2 可接 CI 或计划任务 |
-| 9 | 自检 | 本地 mock 服务器，核心 167 项 + 界面流程 132 项断言，不碰你的真实配置、`~/.claude` 与 `~/.codex` |
+| 9 | 自检 | 本地 mock 服务器，核心 204 项 + 界面流程 157 项断言，不碰你的真实配置、`~/.claude`、`~/.codex`、`~/.grok` |
 | 10 | **Claude Code 一键接入** | 检测 /v1/messages 通道 → 映射模型别名 → 写 settings.json / 生成启动脚本 → 端到端跑通 `claude -p PONG` |
-| 11 | **Codex 一键接入（CLI + 桌面版）** | 检测 `/v1/responses` 与 `/v1/chat/completions` 决定 `wire_api` → 选 GPT 模型 → 合并 `~/.codex/config.toml` + 写**用户级环境变量**（桌面版靠它取 Key）→ 端到端跑通 `codex exec PONG`；接入日志会提示重启桌面版 |
-| 12 | **每把 Key 各归其位** | Claude Code 页默认挑 Anthropic 格式的 Key，Codex 页默认挑 OpenAI 格式的；也可以手动改。
+| 11 | **Codex 一键接入（CLI + 桌面版）** | 检测 `/v1/responses` 与 `/v1/chat/completions` 决定 `wire_api` → 选 GPT 模型 → 合并 `~/.codex/config.toml` + 写**用户级环境变量**（桌面版靠它取 Key）→ 端到端跑通 `codex exec PONG` |
+| 12 | **每把 Key 各归其位** | Claude Code 页默认挑 Anthropic 格式的 Key，Codex 页默认挑 OpenAI 格式的，Grok 页默认用站点当前选中的；都可以手动改 |
+| 13 | **Grok Build 一键接入** | 测三条通道（Chat / Responses / Messages）自动挑 `api_backend` → 写 `~/.grok/config.toml` 的 `[model.api_probe]` → 端到端跑通 `grok -p PONG` |
 
 ---
 
@@ -79,10 +80,10 @@ API Key  [ OpenAI 主 Key ▾ ] [ sk-•••••••• ] [ ]显示 [＋�
 ④ 接入 Codex         检测 /v1/responses 与 /v1/chat/completions → 写 config.toml → 端到端验证
 ```
 
-③ 和 ④ 是**两个独立页面**：一页管 Anthropic 格式（Claude Code），一页管 OpenAI 格式（Codex），
-两边的通道探测、模型选择、接入方式、门禁与日志互不干扰；站点列表与 Key 两边共用。
+③④⑤ 是**三个独立页面**：Claude Code（Anthropic）、Codex（OpenAI）、Grok Build（三种协议都支持），
+各自的通道探测、模型选择、接入方式、门禁与日志互不干扰；站点列表与 Key 三边共用。
 
-顶部按钮栏就是这个顺序：`① 获取模型列表`、`② 对选中模型发测试`、`③ 接入 Claude Code`、`④ 接入 Codex`，
+顶部按钮栏就是这个顺序：`① 获取模型列表`、`② 对选中模型发测试`、`③ 接入 Claude Code`、`④ 接入 Codex`、`⑤ 接入 Grok`，
 另外有一个 **`▶ 全流程（探测 → 测速 → 接入）`** 把整条线一次跑完：它做完 ① 探测、② 生成测试、
 ③ 两条通道的检测（Anthropic + OpenAI）与模型映射，然后停在「接入」前等你确认——
 **真正的写入永远由你点一下**。
@@ -127,7 +128,7 @@ API Key  [ OpenAI 主 Key ▾ ] [ sk-•••••••• ] [ ]显示 [＋�
 | 方式 | 操作 |
 | --- | --- |
 | 图形界面 | 双击 **`启动.bat`**（或用 `python api_probe.py`） |
-| 自检 | 双击 **`自检.bat`**（本地 mock 服务器，167 项断言，不访问外网） |
+| 自检 | 双击 **`自检.bat`**（本地 mock 服务器，204 项断言，不访问外网） |
 | 打包 exe | 双击 **`打包exe.bat`** → 产物在 `dist\ApiProbe.exe` |
 | 命令行 | `python api_probe.py --url https://xxx.com/v1 --key sk-xxx --list-only` |
 
@@ -450,10 +451,11 @@ python api_probe.py --url https://xxx.com/v1 --key sk-xxx --json > out.json
 python api_probe.py --list-only --json          # 第 ① 步的机器可读输出
 python api_probe.py --url ... --claude-check    # 检测这个网关能不能接 Claude Code CLI
 python api_probe.py --url ... --codex-check     # 检测 OpenAI 通道，判断 Codex 该用 responses 还是 chat
+python api_probe.py --url ... --grok-check      # 为 Grok Build 选 api_backend，并打印配置片段
 python api_probe.py --url ... --no-verify       # 跳过 TLS 证书校验（自签证书站点）
 python api_probe.py --url ... --no-deep         # 关闭深度检测，少发一次请求
-python api_probe.py --selftest                  # 核心逻辑自检（167 项）
-python api_probe.py --uitest                    # 界面 + 站点管理 + 两段式 + 两个接入页（132 项）
+python api_probe.py --selftest                  # 核心逻辑自检（204 项）
+python api_probe.py --uitest                    # 界面 + 站点管理 + 两段式 + 三个接入页（157 项）
 ```
 
 退出码：`0` 成功 / `2` 失败（可直接用于脚本巡检、CI 里做连通性卡点）。
@@ -577,7 +579,7 @@ python api_probe.py --url https://your-relay.com/v1 --key sk-xxx --list-only --j
 | --- | --- |
 | `api_probe.py` | 全部功能（核心探测 + 站点管理 + Claude Code / Codex 接入 + 图形界面 + 自检），单文件 |
 | `启动.bat` | 双击启动图形界面（纯 ASCII，勿加中文） |
-| `自检.bat` | 跑 167 项核心逻辑自检（纯 ASCII）；界面/流程自检用 `python api_probe.py --uitest`（132 项） |
+| `自检.bat` | 跑 204 项核心逻辑自检（纯 ASCII）；界面/流程自检用 `python api_probe.py --uitest`（157 项） |
 | `打包exe.bat` | 用 PyInstaller 打成单文件 exe（纯 ASCII） |
 | `README.md` | 本文档 |
 | `LICENSE` | MIT 许可证 |
@@ -590,9 +592,10 @@ python api_probe.py --url https://your-relay.com/v1 --key sk-xxx --list-only --j
 | `~/.claude/settings.json` | Claude Code 配置（本工具只合并 `ANTHROPIC_*` 键，改前自动备份） |
 | `~/.codex/config.toml` | Codex 配置（本工具只改 `model`/`model_provider` 与 `[model_providers.api_probe]`，改前自动备份） |
 | `~/.codex/.env` | Codex 的 `env_key` 取值处（勾选时才会写，明文） |
-| `~/.api_probe/claude-code-<站点>/`、`~/.api_probe/codex-<站点>/` | 生成的启动脚本与隔离配置目录 |
+| `~/.grok/config.toml` | Grok Build 配置（本工具只加 `[model.api_probe]` 与 `[models].default`，改前自动备份） |
+| `~/.api_probe/claude-code-<站点>/`、`codex-<站点>/`、`grok-<站点>/` | 生成的启动脚本与隔离配置目录 |
 
-版本 v1.8.0（Codex 接入支持桌面版：写用户级环境变量、一键打开桌面版、提示重启）
+版本 v1.9.0（新增 Grok Build 一键接入：三通道选 api_backend、合并 ~/.grok/config.toml、端到端验证）
 
 ---
 

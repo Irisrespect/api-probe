@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-API 中转站测活工具 (API Probe)  v1.8.0
+API 中转站测活工具 (API Probe)  v1.9.0
 =====================================================================
 单文件、零第三方依赖的 Windows 桌面小工具（Python 3.9+，自带 tkinter 即可运行）
 
@@ -16,8 +16,10 @@ API 中转站测活工具 (API Probe)  v1.8.0
     ③ 接入 Claude Code  检测 /v1/messages → 映射模型别名 → 写配置 → 端到端验证
     ④ 接入 Codex        检测 /v1/responses 与 /v1/chat/completions → 写 config.toml → 端到端验证
                         （CLI 与桌面版共用 config.toml；桌面版的 Key 走用户级环境变量，改完需重启桌面版）
+    ⑤ 接入 Grok Build   测三条通道并挑 api_backend（Chat/Responses/Messages）→
+                        写 ~/.grok/config.toml 的 [model.api_probe] → 端到端验证
 
-    ③④ 是两个独立页面：一页管 Anthropic 格式，一页管 OpenAI 格式，互不干扰。
+    ③④⑤ 是三个独立页面：Claude Code（Anthropic）、Codex（OpenAI）、Grok Build（三种协议都支持），互不干扰。
     顶部有「▶ 全流程（探测 → 测速 → 接入）」一键跑完；
     两个「一键接入」各有硬门禁：对应通道探测通过才可点（探测本身就是一次真实生成）。
 
@@ -73,6 +75,8 @@ Claude Code 接入细节
     python api_probe.py --url URL --key KEY --model M            # 指定模型直接做第 ② 步
     python api_probe.py --url URL --key KEY --json               # 一次性两步，JSON 输出
     python api_probe.py --url URL --key KEY --claude-check       # 检测能否接 Claude Code
+    python api_probe.py --url URL --key KEY --codex-check        # 检测 Codex 该用哪个 wire_api
+    python api_probe.py --url URL --key KEY --grok-check         # 为 Grok Build 选 api_backend
     python api_probe.py --selftest               # 核心逻辑自检（本地 mock，不访问外网）
     python api_probe.py --uitest                 # 界面 + 站点管理 + 两段式 + 接入页自检
 
@@ -108,7 +112,7 @@ import zlib
 from pathlib import Path
 
 APP_NAME = "API 中转站测活工具"
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.9.0"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) api-probe/1.0"
 DEFAULT_TIMEOUT = 20.0
 CONFIG_PATH = Path.home() / ".api_probe.json"
@@ -1895,10 +1899,12 @@ def chat_reply_text(obj) -> str:
 
 def check_openai_channel(base: str, key: str, model: str = "",
                          timeout: float = DEFAULT_TIMEOUT, verify: bool = True,
-                         log=None, stop_event: threading.Event | None = None) -> dict:
+                         log=None, stop_event: threading.Event | None = None,
+                         prefer: str = "responses") -> dict:
     """检测 OpenAI 格式通道：/v1/responses 与 /v1/chat/completions 哪个可用。
 
     返回里的 wire_api 就是要写进 Codex config.toml 的值（responses / chat）。
+    prefer 决定先试哪条：Codex 用默认的 responses，Grok 传 "chat"（它默认走 chat_completions）。
     """
     def L(msg):
         if log:
@@ -1912,8 +1918,11 @@ def check_openai_channel(base: str, key: str, model: str = "",
         res["verdict"] = "地址为空"
         return res
     probe_timeout = max(5.0, min(timeout, 20.0))
+    order = [("responses", "/responses"), ("chat", "/chat/completions")]
+    if prefer == "chat":
+        order.reverse()
 
-    for wire, path in (("responses", "/responses"), ("chat", "/chat/completions")):
+    for wire, path in order:
         if stop_event is not None and stop_event.is_set():
             res["verdict"] = "已手动停止"
             return res
@@ -2348,7 +2357,350 @@ def write_codex_launcher(env_key: str, key: str, path: str | Path,
 
 
 # =====================================================================
-# 九、图形界面
+# 九、Grok Build 接入
+# =====================================================================
+# Grok Build（TUI）读 ~/.grok/config.toml，第三方网关靠 [model.<key>] 表描述：
+#     [model.<catalog-key>]
+#     model = "<发给 API 的真实模型 id>"
+#     base_url = "https://gw.example.com/v1"
+#     name = "显示名"
+#     api_backend = "chat_completions" | "responses" | "messages"   # 默认 chat_completions
+#     env_key = "GROK_API_KEY"        # 推荐：Key 放环境变量（官方也建议优先 env_key）
+#     api_key = "sk-..."              # 也可以内联
+#     extra_headers = { "x-api-key" = "..." }   # Anthropic 协议要用它传 key
+#     context_window = 128000
+# 三种 api_backend 正好对应本工具已经会测的三条通道，所以用哪条可以由检测结果决定。
+
+GROK_HOME = Path(os.environ.get("GROK_HOME") or (Path.home() / ".grok"))
+GROK_CONFIG_PATH = GROK_HOME / "config.toml"
+GROK_MODEL_KEY = "api_probe"
+GROK_ENV_KEY_DEFAULT = "GROK_API_KEY"
+GROK_MANAGED_BEGIN = "# >>> api-probe managed model (auto-generated) >>>"
+GROK_MANAGED_END = "# <<< api-probe managed model <<<"
+GROK_TOP_BEGIN = "# >>> api-probe managed top-level (auto-generated) >>>"
+GROK_TOP_END = "# <<< api-probe managed top-level <<<"
+GROK_PING_PROMPT = "Reply with exactly: PONG"
+GROK_BACKENDS = ("chat_completions", "responses", "messages")
+BACKEND_LABEL = {"chat_completions": "OpenAI Chat Completions",
+                 "responses": "OpenAI Responses",
+                 "messages": "Anthropic Messages"}
+
+
+def find_grok_cli() -> str:
+    """找 grok：先 PATH，再 ~/.grok/bin（官方安装器的默认位置）。"""
+    try:
+        w = shutil.which("grok")
+        if w:
+            return w
+    except Exception:
+        pass
+    for c in (GROK_HOME / "bin" / "grok.exe", GROK_HOME / "bin" / "grok",
+              Path(os.environ.get("LOCALAPPDATA") or "") / "Programs" / "grok" / "grok.exe"):
+        try:
+            if c.exists():
+                return str(c)
+        except Exception:
+            continue
+    return ""
+
+
+def grok_base_url_for_gateway(base: str) -> str:
+    """Grok 的 base_url 与 Codex 一样要带 /v1。"""
+    root = normalize_base(base)
+    return f"{root}/v1" if root else ""
+
+
+def suggest_grok_model(models: list[dict], fallback: str = "") -> str:
+    """挑一个适合 Grok Build 的默认模型（优先 grok 系，其次通用聊天模型）。"""
+    ids = [str(m.get("id") or "") for m in (models or []) if m.get("id")]
+    if not ids:
+        return fallback or ""
+    if fallback and fallback in ids:
+        return fallback
+    cands = [i for i in ids
+             if not any(b in i.lower() for b in NON_CHAT_MARKERS)
+             and not any(v in i.lower() for v in VARIANT_MARKERS)]
+    for want in ("grok-4", "grok-3", "grok", "gpt-6", "gpt-5", "claude-sonnet", "claude-opus",
+                 "gpt-4.1", "gpt-4o"):
+        hit = [i for i in cands if want in i.lower()]
+        if hit:
+            hit.sort(key=lambda s: (len(s), s))
+            return hit[0]
+    return fallback or (choose_default_model(models) if models else "")
+
+
+def backend_from_channels(anthropic_ok: bool, openai_wire: str) -> str:
+    """根据已探测到的通道决定 Grok 该用哪个 api_backend。
+
+    优先级：chat_completions > responses > messages。
+    理由：chat_completions 是 Grok 的默认协议、也是各网关实现最完整的一条；
+    Responses 虽新，但 Grok 在它上面默认要带 reasoning.summary，
+    有些网关会拒（官方文档也建议对这类网关设 reasoning_summary="none"）；
+    messages 只在网关是 Anthropic 专用时才用。
+    """
+    if openai_wire == "chat":
+        return "chat_completions"
+    if openai_wire == "responses":
+        return "responses"
+    if anthropic_ok:
+        return "messages"
+    return "chat_completions"
+
+
+def _toml_str(v) -> str:
+    """把字符串写成 TOML 基本字符串（转义反斜杠与引号）。"""
+    s = str(v)
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _toml_key(k) -> str:
+    """TOML 表名里的键：是裸键（字母数字下划线横线）就不加引号，否则加引号。"""
+    s = str(k)
+    if re.fullmatch(r"[A-Za-z0-9_-]+", s):
+        return s
+    return _toml_str(s)
+
+
+def render_grok_model_block(catalog_key: str, model: str, base_url: str,
+                            backend: str = "chat_completions",
+                            display_name: str = "API Probe",
+                            env_key: str = "", api_key: str = "",
+                            context_window: int = 200000,
+                            extra_headers: dict | None = None) -> str:
+    """生成 [model.<key>] 表。env_key 与 api_key 二选一（env_key 优先）。"""
+    lines = [GROK_MANAGED_BEGIN,
+             f"[model.{_toml_key(catalog_key)}]",
+             f"model = {_toml_str(model)}",
+             f"base_url = {_toml_str(base_url)}",
+             f"name = {_toml_str(display_name)}",
+             f"api_backend = {_toml_str(backend)}"]
+    if context_window:
+        lines.append(f"context_window = {int(context_window)}")
+    if env_key:
+        lines.append(f"env_key = {_toml_str(env_key)}")
+    elif api_key:
+        lines.append(f"api_key = {_toml_str(api_key)}")
+    if extra_headers:
+        inner = ", ".join(f"{_toml_str(k)} = {_toml_str(v)}" for k, v in extra_headers.items())
+        lines.append(f"extra_headers = {{ {inner} }}")
+    lines.append(GROK_MANAGED_END)
+    return "\n".join(lines) + "\n"
+
+
+def render_grok_top_block(default_key: str) -> str:
+    """托管块：把 [models].default 指到我们的模型。"""
+    return (f"{GROK_TOP_BEGIN}\n"
+            f"[models]\n"
+            f"default = {_toml_str(default_key)}\n"
+            f"{GROK_TOP_END}\n")
+
+
+def merge_grok_config(existing: str, catalog_key: str, model: str, base_url: str,
+                      backend: str = "chat_completions", display_name: str = "API Probe",
+                      env_key: str = "", api_key: str = "",
+                      context_window: int = 200000,
+                      extra_headers: dict | None = None,
+                      set_default: bool = True) -> str:
+    """把 [model.<key>] 合并进现有 config.toml。
+
+    - 先删掉上次由本工具写入的标记区，可反复执行
+    - 只动我们自己的 [model.api_probe]；用户的 [cli]、[auth]、其它 [model.*] 原样保留
+    - set_default=True 时设置 [models].default：用户已有 [models] 段就只改 default 那一行
+      （保留其它字段），没有才追加托管块
+    """
+    text = _strip_marker_block(existing or "", GROK_MANAGED_BEGIN, GROK_MANAGED_END)
+    text = _strip_marker_block(text, GROK_TOP_BEGIN, GROK_TOP_END)
+    block = render_grok_model_block(catalog_key, model, base_url, backend, display_name,
+                                    env_key, api_key, context_window, extra_headers)
+    body = text.strip("\n")
+    if not set_default:
+        return f"{body}\n\n{block}" if body else block
+
+    out_lines: list[str] = []
+    in_models = False
+    replaced = False
+    for line in body.splitlines():
+        s = line.strip()
+        if s.startswith("[") and not s.startswith("[["):
+            in_models = (s == "[models]")
+            out_lines.append(line)
+            continue
+        if in_models and re.match(r"^\s*default\s*=", line):
+            out_lines.append(f"default = {_toml_str(catalog_key)}")
+            replaced = True
+            continue
+        out_lines.append(line)
+    new_body = "\n".join(out_lines).strip("\n")
+    top = "" if replaced else render_grok_top_block(catalog_key)
+    parts = [p for p in (top, new_body, block) if p]
+    return "\n\n".join(parts) + "\n"
+
+
+def install_grok_config(catalog_key: str, model: str, base_url: str,
+                        backend: str = "chat_completions", display_name: str = "API Probe",
+                        env_key: str = "", api_key: str = "", context_window: int = 200000,
+                        extra_headers: dict | None = None, set_default: bool = True,
+                        path: str | Path | None = None) -> dict:
+    """写入 ~/.grok/config.toml（合并 + 备份；现有文件不是合法 TOML 就拒绝写入）。"""
+    p = Path(path) if path else GROK_CONFIG_PATH
+    out = {"ok": False, "path": str(p), "backup": "", "error": "", "old_default": "",
+           "text": ""}
+    existing = ""
+    if p.exists():
+        try:
+            existing = p.read_text(encoding="utf-8")
+        except Exception as e:  # noqa: BLE001
+            out["error"] = f"读取失败，已中止：{e}"
+            return out
+        try:
+            import tomllib
+            parsed = tomllib.loads(existing or "")
+            mt = parsed.get("models")
+            if isinstance(mt, dict):
+                out["old_default"] = str(mt.get("default") or "")
+        except ModuleNotFoundError:
+            pass
+        except Exception as e:  # noqa: BLE001
+            out["error"] = f"现有 config.toml 不是合法 TOML（{e}），已中止以免覆盖：{p}"
+            return out
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        bak = p.with_name(p.name + f".bak-apiprobe-{ts}")
+        try:
+            shutil.copy2(p, bak)
+            out["backup"] = str(bak)
+        except Exception as e:  # noqa: BLE001
+            out["error"] = f"备份失败，已中止：{e}"
+            return out
+    merged = merge_grok_config(existing, catalog_key, model, base_url, backend,
+                               display_name, env_key, api_key, context_window,
+                               extra_headers, set_default)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(merged, encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"写入失败：{e}"
+        return out
+    out.update(ok=True, text=merged)
+    return out
+
+
+def find_grok_backups(path: str | Path | None = None) -> list[Path]:
+    p = Path(path) if path else GROK_CONFIG_PATH
+    try:
+        items = [q for q in p.parent.glob(p.name + ".bak*") if q.is_file()]
+    except Exception:
+        return []
+    return sorted(items, key=lambda q: q.stat().st_mtime, reverse=True)
+
+
+def write_grok_launcher(env_key: str, key: str, path: str | Path,
+                        grok_exe: str = "", grok_home: str = "") -> dict:
+    """启动脚本：临时设好环境变量再拉起 grok（纯 ASCII + CRLF）。"""
+    out = {"ok": False, "path": str(path), "error": ""}
+    for name, val in ((env_key, key), ("GROK_HOME", grok_home), ("grok", grok_exe)):
+        if val and not str(val).isascii():
+            out["error"] = (f"{name} 的值含非 ASCII 字符，没法安全写进 .bat"
+                            "（cmd 按 OEM 码页读批处理）——请改用 env_key 环境变量方式")
+            return out
+    lines = ["@echo off",
+             "rem Grok launcher generated by api_probe - keep this file ASCII-only,",
+             "rem because cmd.exe parses .bat with the OEM code page."]
+    if grok_home:
+        lines.append(f'set "GROK_HOME={grok_home}"')
+    if env_key and key:
+        lines.append(f'set "{env_key}={key}"')
+    lines.append(f'"{grok_exe}" %*' if grok_exe else "grok %*")
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("\r\n".join(lines) + "\r\n", encoding="ascii", newline="")
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"写入失败：{e}"
+        return out
+    out["ok"] = True
+    return out
+
+
+def verify_grok_cli(model_key: str, env_key: str, key: str, cli_path: str = "",
+                    timeout: float = 300.0, log=None, extra_env: dict | None = None,
+                    config_path: str | Path | None = None) -> dict:
+    """端到端验证：`grok -p "Reply with exactly: PONG" -m <key> --output-format json`。
+
+    用的是 config_path（默认 ~/.grok/config.toml）里的模型配置，Key 通过 env_key 传入。
+    """
+    def L(msg):
+        if log:
+            log(msg)
+
+    res = {"ok": False, "cli": "", "cmd": "", "result": "", "error": "", "raw": "",
+           "model_key": model_key}
+    cli = cli_path or find_grok_cli()
+    if cli and not Path(cli).exists():
+        try:
+            if not shutil.which(cli):
+                cli = ""
+        except Exception:
+            cli = ""
+    res["cli"] = cli
+    if not cli:
+        res["error"] = "没找到 grok 命令（官方安装器通常放在 ~/.grok/bin/grok.exe）"
+        return res
+
+    work = Path(tempfile.mkdtemp(prefix="api_probe_grokwork_"))
+    args = [cli, "-p", GROK_PING_PROMPT, "-m", model_key,
+            "--output-format", "json", "--max-turns", "1", "--cwd", str(work)]
+    if cli.lower().endswith((".cmd", ".bat")):
+        args = ["cmd", "/c"] + args
+    res["cmd"] = " ".join(args)
+    run_env = dict(os.environ)
+    if extra_env:
+        run_env.update({k: str(v) for k, v in extra_env.items() if v})
+    if env_key and key:
+        run_env[env_key] = key
+    if config_path:
+        run_env["GROK_HOME"] = str(Path(config_path).parent)
+    L(f"  执行：{res['cmd']}")
+    try:
+        cp = subprocess.run(args, env=run_env, capture_output=True, text=True,
+                            encoding="utf-8", errors="replace", timeout=timeout,
+                            cwd=str(work))
+    except subprocess.TimeoutExpired:
+        res["error"] = f"执行超时（>{timeout:.0f}s）"
+        shutil.rmtree(work, ignore_errors=True)
+        return res
+    except Exception as e:  # noqa: BLE001
+        res["error"] = f"执行失败：{type(e).__name__}: {e}"
+        shutil.rmtree(work, ignore_errors=True)
+        return res
+    shutil.rmtree(work, ignore_errors=True)
+    raw = (cp.stdout or "").strip()
+    res["raw"] = ((cp.stdout or "") + "\n" + (cp.stderr or "")).strip()[-2000:]
+    obj = safe_json(raw)
+    text = ""
+    if isinstance(obj, dict):
+        for kn in ("result", "response", "text", "content", "message"):
+            v = obj.get(kn)
+            if isinstance(v, str) and v.strip():
+                text = v.strip()
+                break
+        if not text and isinstance(obj.get("messages"), list):
+            for m in obj["messages"]:
+                if isinstance(m, dict) and isinstance(m.get("content"), str):
+                    text += m["content"]
+            text = text.strip()
+        if obj.get("is_error") is True and not res["error"]:
+            res["error"] = str(obj.get("result") or obj.get("error") or "grok 报错")[:400]
+    if not text:
+        text = raw
+    res["result"] = text[-600:]
+    res["ok"] = "PONG" in text
+    if not res["ok"] and not res["error"]:
+        res["error"] = ((cp.stderr or "").strip() or raw)[-400:] or "输出里没有 PONG"
+    return res
+
+
+# =====================================================================
+# 十、图形界面
 # =====================================================================
 
 # 「站点」下拉里那个不落盘的临时项
@@ -2484,9 +2836,11 @@ class ProbeApp:
         # Claude Code 接入
         self.cc_state: dict = {}                  # 最近一次 Anthropic 通道检测结果
         self.codex_state: dict = {}               # 最近一次 OpenAI 通道检测结果
+        self.grok_state: dict = {}                # 最近一次 Grok 协议选择结果
         self.cc_model_vars: dict = {}             # 别名 -> (StringVar, Combobox)
         self.tab_claude = None
         self.tab_codex = None
+        self.tab_grok = None
 
         root.title(f"{APP_NAME} v{APP_VERSION}")
         root.geometry("1180x760")
@@ -2608,6 +2962,8 @@ class ProbeApp:
                    command=self.goto_claude_tab).pack(side="left", padx=6)
         ttk.Button(btns, text="④  接入 Codex",
                    command=self.goto_codex_tab).pack(side="left", padx=6)
+        ttk.Button(btns, text="⑤  接入 Grok",
+                   command=self.goto_grok_tab).pack(side="left", padx=6)
         self.btn_flow = ttk.Button(btns, text="▶  全流程（探测 → 测速 → 接入）",
                                    command=self.run_full_flow)
         self.btn_flow.pack(side="left", padx=(14, 4))
@@ -2628,6 +2984,7 @@ class ProbeApp:
         self._build_tab_batch()
         self._build_tab_claude()
         self._build_tab_codex()
+        self._build_tab_grok()
         self._build_tab_log()
 
         # 底部状态
@@ -2968,6 +3325,119 @@ class ProbeApp:
         self.txt_codex.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
         vs.pack(side="right", fill="y", pady=6, padx=(0, 6))
 
+    def _build_tab_grok(self):
+        tk, ttk = self.tk, self.ttk
+        frame = ttk.Frame(self.nb)
+        self.nb.add(frame, text="  Grok Build  ")
+        self.tab_grok = frame
+
+        head = ttk.LabelFrame(
+            frame, text=" ⑤ 接入 Grok Build —— 写入 ~/.grok/config.toml 的 [model.api_probe]；"
+                        "支持 chat_completions / responses / messages 三种协议 ")
+        head.pack(fill="x", padx=6, pady=(6, 4))
+        r1 = ttk.Frame(head)
+        r1.pack(fill="x", padx=8, pady=(6, 2))
+        self.btn_grok_check = ttk.Button(r1, text="自动选协议（测三条通道）",
+                                         command=self.grok_check)
+        self.btn_grok_check.pack(side="left")
+        ttk.Label(r1, text="（优先 Chat Completions，其次 Responses / Anthropic Messages）",
+                  style="Hint.TLabel").pack(side="left", padx=6)
+        self.lbl_grok_cli = ttk.Label(r1, text="", style="Hint.TLabel")
+        self.lbl_grok_cli.pack(side="right")
+
+        self.tv_grok = ttk.Treeview(head, columns=("k", "v"), show="headings", height=6)
+        self.tv_grok.heading("k", text="项目")
+        self.tv_grok.heading("v", text="结果")
+        self.tv_grok.column("k", width=130, anchor="w", stretch=False)
+        self.tv_grok.column("v", width=860, anchor="w")
+        self.tv_grok.pack(fill="x", padx=8, pady=(2, 8))
+        for lvl, color in COLORS.items():
+            self.tv_grok.tag_configure(lvl, foreground=color)
+
+        mapf = ttk.LabelFrame(frame, text=" 模型与协议（写入 ~/.grok/config.toml） ")
+        mapf.pack(fill="x", padx=6, pady=4)
+        grid = ttk.Frame(mapf)
+        grid.pack(fill="x", padx=8, pady=(6, 2))
+        ttk.Label(grid, text="默认模型").grid(row=0, column=0, sticky="w", padx=(0, 4), pady=3)
+        self.var_grok_model = tk.StringVar()
+        self.cmb_grok_model = ttk.Combobox(grid, textvariable=self.var_grok_model, width=32,
+                                           font=self.mono_font)
+        self.cmb_grok_model.grid(row=0, column=1, sticky="we", padx=(0, 16), pady=3)
+        ttk.Label(grid, text="base_url").grid(row=0, column=2, sticky="w", padx=(0, 4), pady=3)
+        self.var_grok_base = tk.StringVar()
+        ttk.Entry(grid, textvariable=self.var_grok_base, width=34,
+                  font=self.mono_font).grid(row=0, column=3, sticky="we", pady=3)
+        ttk.Label(grid, text="api_backend").grid(row=1, column=0, sticky="w", padx=(0, 4), pady=3)
+        self.var_grok_backend = tk.StringVar(value="chat_completions")
+        ttk.Combobox(grid, textvariable=self.var_grok_backend, width=32, state="readonly",
+                     values=list(GROK_BACKENDS)).grid(row=1, column=1, sticky="we",
+                                                      padx=(0, 16), pady=3)
+        ttk.Label(grid, text="Key 环境变量").grid(row=1, column=2, sticky="w", padx=(0, 4), pady=3)
+        self.var_grok_envkey = tk.StringVar(value=GROK_ENV_KEY_DEFAULT)
+        ttk.Entry(grid, textvariable=self.var_grok_envkey, width=34,
+                  font=self.mono_font).grid(row=1, column=3, sticky="we", pady=3)
+        ttk.Label(grid, text="context_window").grid(row=2, column=0, sticky="w",
+                                                    padx=(0, 4), pady=3)
+        self.var_grok_ctx = tk.StringVar(value="200000")
+        ttk.Entry(grid, textvariable=self.var_grok_ctx, width=32,
+                  font=self.mono_font).grid(row=2, column=1, sticky="we", padx=(0, 16), pady=3)
+        ttk.Label(grid, text="使用哪个 Key").grid(row=2, column=2, sticky="w", padx=(0, 4), pady=3)
+        self.var_grok_key = tk.StringVar()
+        self.cmb_grok_key = ttk.Combobox(grid, textvariable=self.var_grok_key, width=34,
+                                         state="readonly")
+        self.cmb_grok_key.grid(row=2, column=3, sticky="we", pady=3)
+        grid.columnconfigure(1, weight=1)
+        grid.columnconfigure(3, weight=1)
+        r2 = ttk.Frame(mapf)
+        r2.pack(fill="x", padx=8, pady=(0, 6))
+        ttk.Button(r2, text="从当前站点模型列表挑一个",
+                   command=self.grok_autofill).pack(side="left")
+        ttk.Label(r2, text="（优先 grok 系；也可手打。模型名会作为 [model] 里的 model id）",
+                  style="Hint.TLabel").pack(side="left", padx=6)
+
+        act = ttk.LabelFrame(frame, text=" 接入方式（可多选） ")
+        act.pack(fill="x", padx=6, pady=4)
+        self.grok_write_config = tk.BooleanVar(value=True)
+        self.grok_write_sysenv = tk.BooleanVar(value=True)
+        self.grok_write_inline = tk.BooleanVar(value=False)
+        self.grok_write_launcher = tk.BooleanVar(value=False)
+        self.grok_run_verify = tk.BooleanVar(value=True)
+        self.grok_set_default = tk.BooleanVar(value=True)
+        ttk.Checkbutton(act, text="写入 ~/.grok/config.toml（只加 [model.api_probe]，改前备份）",
+                        variable=self.grok_write_config).pack(anchor="w", padx=8, pady=(6, 2))
+        ttk.Checkbutton(act, text="写入用户级环境变量（推荐：Key 不进配置文件，Grok 的 env_key 从这里取）",
+                        variable=self.grok_write_sysenv).pack(anchor="w", padx=8, pady=2)
+        ttk.Checkbutton(act, text="改为把 Key 内联进 config.toml 的 api_key（明文，不推荐）",
+                        variable=self.grok_write_inline).pack(anchor="w", padx=8, pady=2)
+        ttk.Checkbutton(act, text="同时把 [models].default 指向这个模型（不勾则只是新增一个可选模型）",
+                        variable=self.grok_set_default).pack(anchor="w", padx=8, pady=2)
+        r3 = ttk.Frame(act)
+        r3.pack(fill="x", padx=8, pady=2)
+        ttk.Checkbutton(r3, text="生成启动脚本（临时设环境变量再启动 grok）",
+                        variable=self.grok_write_launcher).pack(side="left")
+        ttk.Checkbutton(r3, text="运行端到端验证（grok -p PONG）",
+                        variable=self.grok_run_verify).pack(side="left", padx=(16, 0))
+        r4 = ttk.Frame(act)
+        r4.pack(fill="x", padx=8, pady=(2, 8))
+        self.btn_grok_install = ttk.Button(r4, text="▶  一键接入 Grok Build",
+                                           command=self.grok_install, state="disabled")
+        self.btn_grok_install.pack(side="left")
+        self.lbl_grok_gate = ttk.Label(r4, text="", style="Hint.TLabel")
+        self.lbl_grok_gate.pack(side="left", padx=8)
+        ttk.Button(r4, text="仅预览配置", command=self.grok_preview).pack(side="left", padx=4)
+        ttk.Button(r4, text="恢复上次备份", command=self.grok_restore).pack(side="left", padx=(14, 4))
+        ttk.Button(r4, text="打开 ~/.grok", command=self.grok_open_dir).pack(side="left")
+
+        logf = ttk.LabelFrame(frame, text=" 执行日志 ")
+        logf.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.txt_grok = tk.Text(logf, font=self.mono_font, wrap="word", height=8,
+                                background="#111827", foreground="#e5e7eb",
+                                insertbackground="#e5e7eb")
+        vs = ttk.Scrollbar(logf, orient="vertical", command=self.txt_grok.yview)
+        self.txt_grok.configure(yscrollcommand=vs.set)
+        self.txt_grok.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
+        vs.pack(side="right", fill="y", pady=6, padx=(0, 6))
+
     def _build_tab_log(self):
         tk, ttk = self.tk, self.ttk
         frame = ttk.Frame(self.nb)
@@ -3159,17 +3629,18 @@ class ProbeApp:
             pass
 
     def _set_action_busy(self, flag: bool) -> None:
-        """忙碌时禁用「检测 / 全流程」，并按各自门禁决定两个「一键接入」是否可点。"""
+        """忙碌时禁用「检测 / 全流程」，并按各自门禁决定各「一键接入」是否可点。"""
         state = "disabled" if flag else "normal"
         for btn in (getattr(self, "btn_cc_check", None), getattr(self, "btn_flow", None),
-                    getattr(self, "btn_codex_check", None)):
+                    getattr(self, "btn_codex_check", None), getattr(self, "btn_grok_check", None)):
             try:
                 btn.configure(state=state)
             except Exception:
                 pass
         if flag:
             for btn in (getattr(self, "btn_cc_install", None),
-                        getattr(self, "btn_codex_install", None)):
+                        getattr(self, "btn_codex_install", None),
+                        getattr(self, "btn_grok_install", None)):
                 try:
                     btn.configure(state="disabled")
                 except Exception:
@@ -3177,6 +3648,7 @@ class ProbeApp:
         else:
             self._refresh_cc_gate()
             self._refresh_codex_gate()
+            self._refresh_grok_gate()
 
     def goto_claude_tab(self):
         self.nb.select(self.tab_claude)
@@ -3745,6 +4217,306 @@ class ProbeApp:
     def codex_open_dir(self):
         self._open_path(CODEX_HOME)
 
+    # ---------------- Grok Build 接入 ----------------
+    def grok_log_msg(self, msg: str) -> None:
+        self.q.put(("grok_log", msg))
+
+    def _grok_log_append(self, msg: str) -> None:
+        self.txt_grok.insert("end", f"{time.strftime('%H:%M:%S')}  {msg}\n")
+        self.txt_grok.see("end")
+
+    def goto_grok_tab(self):
+        self.nb.select(self.tab_grok)
+        self.grok_refresh_context()
+        self._set_status("先点「自动选协议」，通过后再「一键接入 Grok Build」")
+
+    def grok_refresh_context(self):
+        """刷新候选模型、base_url、grok 路径。"""
+        models = (self.site_result or {}).get("models") or []
+        ids = [str(m.get("id") or "") for m in models if m.get("id")]
+        self.cmb_grok_model.configure(values=ids)
+        if not self.var_grok_model.get():
+            self.var_grok_model.set(
+                suggest_grok_model(models, fallback=self.var_model.get().strip()))
+        self.var_grok_base.set(grok_base_url_for_gateway(self.var_url.get().strip()))
+        cli = find_grok_cli()
+        self.lbl_grok_cli.configure(text=("CLI：" + cli) if cli
+                                    else "没找到 grok（端到端验证会跳过）")
+
+    def grok_autofill(self):
+        models = (self.site_result or {}).get("models") or []
+        if not models:
+            self._set_status("还没有模型列表：先在主界面点「① 获取模型列表」")
+            return
+        pick = suggest_grok_model(models, fallback=self.var_model.get().strip())
+        if pick:
+            self.var_grok_model.set(pick)
+            self._set_status(f"已选默认模型：{pick}")
+
+    def grok_ready(self) -> tuple[bool, str]:
+        """门禁：协议探测通过（即那条通道实测能出 PONG）才允许接入。"""
+        ch = self.grok_state or {}
+        gen_ok = bool((self.site_result or {}).get("ok"))
+        if ch.get("ok"):
+            return True, ("" if gen_ok else
+                          "注意：第 ② 步生成测试未通过，但 Grok 要用的那条通道已实测可用")
+        if ch:
+            return False, f"协议探测未通过：{ch.get('verdict') or '未知原因'}"
+        return False, "还没探测协议：先点「自动选协议（测三条通道）」"
+
+    def _refresh_grok_gate(self) -> None:
+        ok, why = self.grok_ready()
+        try:
+            self.btn_grok_install.configure(state="normal" if ok else "disabled")
+            self.lbl_grok_gate.configure(
+                text=(("已解锁，可以接入" + (f"（{why}）" if why else "")) if ok
+                      else f"未解锁：{why}"),
+                foreground=COLORS["ok"] if ok else COLORS["muted"])
+        except Exception:
+            pass
+
+    def grok_check(self):
+        """依次探测三种协议，按 Anthropic > Responses > Chat 的优先级挑一个能用的。"""
+        if self.busy:
+            self._set_status("正在测试中，请稍候…")
+            return
+        base = self.var_url.get().strip()
+        if not base:
+            self._set_status("请先填写 API 地址")
+            return
+        key = self._key_value_for(self.var_grok_key, "")
+        model = self.var_grok_model.get().strip() or self.var_model.get().strip()
+        self.stop_event.clear()
+        self.busy = True
+        self._set_action_busy(True)
+        self._set_status("正在探测三种协议…")
+        self._grok_log_append(f"=== 探测协议：{base}（模型 {model or '未指定'}）===")
+        timeout, verify = self._timeout(), bool(self.var_verify.get())
+
+        def work():
+            try:
+                ach = check_anthropic_channel(base, key, model, timeout=timeout,
+                                              verify=verify, log=self.grok_log_msg,
+                                              stop_event=self.stop_event)
+                och = check_openai_channel(base, key, model, timeout=timeout, verify=verify,
+                                           log=self.grok_log_msg, stop_event=self.stop_event,
+                                           prefer="chat")
+                backend = backend_from_channels(bool(ach.get("ok")), och.get("wire_api") or "")
+                res = {"ok": bool(ach.get("ok") or och.get("ok")), "backend": backend,
+                       "anthropic": ach, "openai": och}
+                if res["ok"]:
+                    res["verdict"] = (f"用 {BACKEND_LABEL.get(backend, backend)}"
+                                      f"（api_backend = {backend}）")
+                    res["verdict_level"] = "ok"
+                else:
+                    res["verdict"] = ("三条通道都没通："
+                                      + (ach.get("verdict") or "") + "；"
+                                      + (och.get("verdict") or ""))
+                    res["verdict_level"] = "error"
+                self.q.put(("grok_check_done", res))
+            except Exception as e:  # noqa: BLE001
+                self.q.put(("fatal", f"{type(e).__name__}: {e}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _render_grok_check(self, res: dict):
+        self.grok_state = res
+        tv = self.tv_grok
+        tv.delete(*tv.get_children())
+
+        def add(k, v, level="info"):
+            tv.insert("", "end", values=(k, v), tags=(level,))
+
+        add("结论", res.get("verdict", ""), res.get("verdict_level", "info"))
+        add("选用的 api_backend", res.get("backend") or "-",
+            "ok" if res.get("ok") else "warn")
+        add("对应的协议", BACKEND_LABEL.get(res.get("backend") or "", "-"), "muted")
+        ach = res.get("anthropic") or {}
+        och = res.get("openai") or {}
+        add("Anthropic Messages", ach.get("verdict") or "-",
+            "ok" if ach.get("ok") else "warn")
+        add("OpenAI Responses", (och.get("tried") or [{}])[0].get("error") or
+            ("可用" if (och.get("wire_api") == "responses") else "不可用"),
+            "ok" if och.get("wire_api") == "responses" else "warn")
+        add("OpenAI Chat Completions", (och.get("tried") or [{}, {}])[-1].get("error") or
+            ("可用" if (och.get("wire_api") == "chat") else "不可用"),
+            "ok" if och.get("wire_api") == "chat" else "warn")
+        if res.get("ok"):
+            self.var_grok_backend.set(res["backend"])
+        self._grok_log_append(f"探测结论：{res.get('verdict', '')}")
+        self._set_status("协议探测完成")
+        self._finish_busy()
+
+    def grok_params(self):
+        model = self.var_grok_model.get().strip() or self.var_model.get().strip()
+        base_url = self.var_grok_base.get().strip() or \
+            grok_base_url_for_gateway(self.var_url.get().strip())
+        backend = self.var_grok_backend.get().strip() or "chat_completions"
+        if backend not in GROK_BACKENDS:
+            backend = "chat_completions"
+        env_key = self.var_grok_envkey.get().strip() or GROK_ENV_KEY_DEFAULT
+        try:
+            ctx = max(1000, int(self.var_grok_ctx.get().strip() or 200000))
+        except Exception:
+            ctx = 200000
+        return model, base_url, backend, env_key, ctx
+
+    def grok_preview(self):
+        model, base_url, backend, env_key, ctx = self.grok_params()
+        if not model or not base_url:
+            self._set_status("需要地址与模型才能预览")
+            return
+        existing = ""
+        try:
+            if GROK_CONFIG_PATH.exists():
+                existing = GROK_CONFIG_PATH.read_text(encoding="utf-8")
+        except Exception:
+            pass
+        inline = bool(self.grok_write_inline.get())
+        key = "" if inline else ""
+        merged = merge_grok_config(
+            existing, GROK_MODEL_KEY, model, base_url, backend,
+            self.var_site.get() or "API Probe",
+            env_key="" if inline else env_key,
+            api_key=self._key_value_for(self.var_grok_key, "") if inline else "",
+            context_window=ctx,
+            extra_headers={"x-api-key": "***"} if backend == "messages" and inline else None,
+            set_default=bool(self.grok_set_default.get()))
+        self._grok_log_append("=== 预览：合并后的 ~/.grok/config.toml ===")
+        for line in merged.splitlines()[:40]:
+            self._grok_log_append(line)
+        self._set_status("预览已打印到下方日志")
+
+    def grok_install(self):
+        from tkinter import messagebox
+        if self.busy:
+            self._set_status("正在测试中，请稍候…")
+            return
+        ready, why = self.grok_ready()
+        if not ready:
+            self._set_status(why)
+            try:
+                messagebox.showwarning("还不能接入 Grok Build", why)
+            except Exception:
+                pass
+            return
+        model, base_url, backend, env_key, ctx = self.grok_params()
+        if not model or not base_url:
+            self._set_status("缺少模型或地址")
+            return
+        key = self._key_value_for(self.var_grok_key, "")
+        do_config = bool(self.grok_write_config.get())
+        do_sysenv = bool(self.grok_write_sysenv.get())
+        do_inline = bool(self.grok_write_inline.get())
+        do_launcher = bool(self.grok_write_launcher.get())
+        do_verify = bool(self.grok_run_verify.get())
+        set_default = bool(self.grok_set_default.get())     # Tk 变量只在主线程读
+        if not any((do_config, do_sysenv, do_inline, do_launcher, do_verify)):
+            self._set_status("没有勾选任何接入方式")
+            return
+        if (do_sysenv or do_launcher) and not key:
+            if not messagebox.askyesno("没有 Key", "要写环境变量 / 生成启动脚本，但没有 Key。继续？"):
+                return
+        if do_inline and not key:
+            self._set_status("勾了「内联 Key」但输入框里没有 Key")
+            return
+        site = self.var_site.get()
+        slug = slugify(site if site != ADHOC_SITE else "custom")
+        outdir = CLAUDE_OUTPUT_DIR / f"grok-{slug}"
+        cli = find_grok_cli()
+        timeout = max(60.0, self._timeout() * 6)
+        self.stop_event.clear()
+        self.busy = True
+        self._set_action_busy(True)
+        self._set_status("正在接入 Grok Build…")
+        self._grok_log_append(f"=== 一键接入 Grok 开始（站点 {site}，模型 {model}，"
+                              f"api_backend {backend}）===")
+
+        def work():
+            summary = {"ok": True, "lines": []}
+
+            def note(msg, ok=True):
+                summary["lines"].append(msg)
+                summary["ok"] = summary["ok"] and ok
+                self.grok_log_msg(msg)
+
+            try:
+                if do_config:
+                    extra = ({"x-api-key": key} if (do_inline and backend == "messages"
+                                                    and key) else None)
+                    r = install_grok_config(
+                        GROK_MODEL_KEY, model, base_url, backend,
+                        site or "API Probe",
+                        env_key="" if do_inline else env_key,
+                        api_key=key if do_inline else "",
+                        context_window=ctx, extra_headers=extra,
+                        set_default=set_default)
+                    if r["ok"]:
+                        old = (f"（原 [models].default = {r['old_default']}，已备份）"
+                               if r["old_default"] else
+                               ("（原本没有配置文件）" if not r["backup"] else ""))
+                        note(f"✔ 已写入 {r['path']}{old}")
+                    else:
+                        note(f"✘ 写 config.toml 失败：{r['error']}", ok=False)
+                if do_sysenv:
+                    r = set_user_env_var(env_key, key)
+                    if r["ok"]:
+                        note(f"✔ 已写入用户级环境变量 {env_key}"
+                             + ("（已广播，新启动的程序立刻可见）" if r["persisted"] else ""))
+                    else:
+                        note(f"✘ 写用户级环境变量失败：{r['error']}", ok=False)
+                if do_launcher:
+                    lp = outdir / f"start-grok-{slug}.bat"
+                    r = write_grok_launcher(env_key, key, lp, cli, str(GROK_HOME))
+                    note(f"✔ 启动脚本：{r['path']}" if r["ok"]
+                         else f"✘ 启动脚本失败：{r['error']}", ok=r["ok"])
+                if do_verify:
+                    note("… 正在跑端到端验证（grok -p PONG），可能要几十秒")
+                    vr = verify_grok_cli(GROK_MODEL_KEY, env_key, key, cli_path=cli,
+                                         timeout=timeout, log=self.grok_log_msg)
+                    if vr["ok"]:
+                        note(f"✔ 端到端验证通过：{vr['result'].strip()[:120]!r}")
+                    else:
+                        note(f"✘ 端到端验证未通过：{vr['error']}", ok=False)
+                self.q.put(("grok_install_done", summary))
+            except Exception as e:  # noqa: BLE001
+                self.q.put(("fatal", f"{type(e).__name__}: {e}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finish_grok_install(self, summary: dict):
+        ok = bool(summary.get("ok"))
+        self._grok_log_append("=== 一键接入 Grok 完成 ===" if ok
+                              else "=== 一键接入 Grok 完成（有失败项，见上）===")
+        self._set_status("Grok 接入完成" if ok else "Grok 接入完成，但有失败项（见日志）")
+        self._finish_busy()
+
+    def grok_restore(self):
+        from tkinter import messagebox
+        baks = find_grok_backups()
+        if not baks:
+            self._set_status("没有找到 config.toml 的备份")
+            return
+        newest = baks[0]
+        if not messagebox.askyesno("恢复备份",
+                                   f"用这个备份覆盖 ~/.grok/config.toml？\n\n{newest}\n\n"
+                                   "（当前文件会先另存一份再覆盖）"):
+            return
+        try:
+            if GROK_CONFIG_PATH.exists():
+                ts = time.strftime("%Y%m%d-%H%M%S")
+                shutil.copy2(GROK_CONFIG_PATH,
+                             GROK_CONFIG_PATH.with_name(GROK_CONFIG_PATH.name
+                                                        + f".bak-apiprobe-{ts}"))
+            shutil.copy2(newest, GROK_CONFIG_PATH)
+            self._grok_log_append(f"✔ 已从备份恢复：{newest}")
+            self._set_status("已恢复备份")
+        except Exception as e:  # noqa: BLE001
+            self._set_status(f"恢复失败：{e}")
+
+    def grok_open_dir(self):
+        self._open_path(GROK_HOME)
+
     # ---------------- 小工具 ----------------
     def _toggle_key(self):
         self.ent_key.configure(show="" if self.var_show.get() else "*")
@@ -3806,18 +4578,20 @@ class ProbeApp:
         self._refresh_cli_key_combos()
 
     def _refresh_cli_key_combos(self) -> None:
-        """两个 CLI 接入页各自按格式偏好挑一把 Key。"""
+        """三个 CLI 接入页各自按格式偏好挑一把 Key。"""
         rec = self._record_for(self._active_site) or {}
         names = [k["name"] for k in site_keys(rec)]
         for cmb_name, var_name, fmt in (("cmb_cc_key", "var_cc_key", "anthropic"),
-                                        ("cmb_codex_key", "var_codex_key", "openai")):
+                                        ("cmb_codex_key", "var_codex_key", "openai"),
+                                        ("cmb_grok_key", "var_grok_key", "")):
             cmb = getattr(self, cmb_name, None)
             var = getattr(self, var_name, None)
             if cmb is None or var is None:
                 continue
             try:
                 cmb.configure(values=names or ["（用主界面的 Key）"])
-                k = pick_site_key(rec, fmt)
+                k = pick_site_key(rec, fmt) if fmt else (
+                    find_site_key(rec, str(rec.get("active_key") or "")) or pick_site_key(rec))
                 var.set(k["name"] if k else (names[0] if names else "（用主界面的 Key）"))
             except Exception:
                 pass
@@ -3944,14 +4718,16 @@ class ProbeApp:
         self.last_result = None
         self.cc_state = {}
         self.codex_state = {}
+        self.grok_state = {}
         self._site_signature = ""
         self.btn_gen.configure(state="disabled")
         self.lbl_picked.configure(text="（未选择）")
         self.tv_ov.delete(*self.tv_ov.get_children())
         self.tv_models.delete(*self.tv_models.get_children())
         self.lbl_models.configure(text="（尚未获取列表）")
-        self._refresh_cc_gate()               # 站点一变，两个接入门禁立刻关上
+        self._refresh_cc_gate()               # 站点一变，三个接入门禁立刻关上
         self._refresh_codex_gate()
+        self._refresh_grok_gate()
         try:
             self.nb.select(0)
         except Exception:
@@ -4606,6 +5382,12 @@ class ProbeApp:
                     self._render_codex_check(data)
                 elif kind == "codex_install_done":
                     self._finish_codex_install(data)
+                elif kind == "grok_log":
+                    self._grok_log_append(str(data))
+                elif kind == "grok_check_done":
+                    self._render_grok_check(data)
+                elif kind == "grok_install_done":
+                    self._finish_grok_install(data)
                 elif kind == "flow_done":
                     self._render_flow(data)
                 elif kind == "batch_row":
@@ -4656,8 +5438,9 @@ class ProbeApp:
         self._log_append(f"=== 第 1 步完成：{res.get('verdict', '')} ===")
         self._finish_busy()
         try:
-            self.cc_refresh_context()          # 顺手把候选模型喂给两个 CLI 接入页
+            self.cc_refresh_context()          # 顺手把候选模型喂给三个 CLI 接入页
             self.codex_refresh_context()
+            self.grok_refresh_context()
         except Exception:
             pass
 
@@ -4911,7 +5694,7 @@ def run_gui() -> int:
 
 
 # =====================================================================
-# 十、自检（本地 mock 服务器，不访问外网）
+# 十一、自检（本地 mock 服务器，不访问外网）
 # =====================================================================
 
 def _mock_server(mode: str):
@@ -5583,6 +6366,157 @@ def selftest() -> int:
           f"-> {badlaunch}")
     check("空 env_key 不写环境变量", set_user_env_var("", "x")["ok"] is False)
 
+    print("\n[14] Grok Build 接入")
+    check("Grok base_url 自动补 /v1",
+          grok_base_url_for_gateway("https://gw.example.com") == "https://gw.example.com/v1")
+    check("Grok base_url 不重复 /v1",
+          grok_base_url_for_gateway("https://gw.example.com/v1/") == "https://gw.example.com/v1")
+    check("协议选择：chat 优先（Grok 默认且最兼容）",
+          backend_from_channels(True, "chat") == "chat_completions")
+    check("协议选择：只有 responses 时用 responses",
+          backend_from_channels(True, "responses") == "responses")
+    check("协议选择：只有 Anthropic 时用 messages",
+          backend_from_channels(True, "") == "messages")
+    check("协议选择：全不通时兜底 chat_completions",
+          backend_from_channels(False, "") == "chat_completions")
+    check("Grok 模型挑选优先 grok 系",
+          suggest_grok_model([{"id": x} for x in
+                              ["gpt-4o", "text-embedding-3-small", "grok-4.5", "grok-3"]])
+          == "grok-4.5")
+    check("没有 grok 时退到通用聊天模型",
+          suggest_grok_model([{"id": "text-embedding-3-small"}, {"id": "gpt-5"}]) == "gpt-5")
+
+    blk = render_grok_model_block("api_probe", "grok-4.5", "https://gw.example.com/v1",
+                                  "responses", "我的站点", env_key="GROK_API_KEY",
+                                  context_window=128000)
+    check("模型表里有 model/base_url/api_backend",
+          'model = "grok-4.5"' in blk and 'base_url = "https://gw.example.com/v1"' in blk
+          and 'api_backend = "responses"' in blk)
+    check("模型表用 env_key 而不是明文 key",
+          'env_key = "GROK_API_KEY"' in blk and "api_key" not in blk)
+    check("context_window 写进去了", "context_window = 128000" in blk)
+    blk2 = render_grok_model_block("api_probe", "m", "https://gw/v1", "messages",
+                                   extra_headers={"x-api-key": "sk-x"})
+    check("messages 协议能带 extra_headers",
+          'extra_headers = { "x-api-key" = "sk-x" }' in blk2)
+    blk3 = render_grok_model_block("api_probe", "m", "https://gw/v1", api_key="sk-inline")
+    check("不传 env_key 时退回内联 api_key", 'api_key = "sk-inline"' in blk3)
+    check("TOML 字符串会转义", "\\\\" in _toml_str("a\\b") and '\\"' in _toml_str('a"b'))
+
+    existing_grok = ('[cli]\ninstaller = "internal"\n\n'
+                     '[models]\ndefault = "grok-4.5"\nallowed_models = ["grok-4.5"]\n\n'
+                     '[model.grok-4.6]\ntemperature = 0.5\n')
+    mg = merge_grok_config(existing_grok, "api_probe", "grok-4.5", "https://gw.example.com/v1",
+                           "responses", "我的站点", "GROK_API_KEY", "", 128000, None, True)
+    check("合并后保留了用户的 [cli] 段", "[cli]" in mg and 'installer = "internal"' in mg)
+    check("合并后保留了用户其它 model 表", "[model.grok-4.6]" in mg and "temperature = 0.5" in mg)
+    check("合并后 default 被改成我们的模型", 'default = "api_probe"' in mg)
+    check("合并后没有重复的 default 行", mg.count("default =") == 1)
+    check("合并后 [models] 里的其它字段还在", 'allowed_models = ["grok-4.5"]' in mg)
+    check("合并后有自己的 model 表", "[model.api_probe]" in mg)
+    mg2 = merge_grok_config(mg, "api_probe", "grok-4.5", "https://gw.example.com/v1",
+                            "responses", "我的站点", "GROK_API_KEY", "", 128000, None, True)
+    check("重复执行不产生重复表", mg2.count("[model.api_probe]") == 1)
+    try:
+        import tomllib
+        parsed = tomllib.loads(mg2)
+        check("合并结果是合法 TOML 且值正确",
+              parsed["model"]["api_probe"]["api_backend"] == "responses"
+              and parsed["models"]["default"] == "api_probe"
+              and parsed["cli"]["installer"] == "internal")
+    except ImportError:
+        check("（Python<3.11 无 tomllib，跳过解析校验）", True)
+
+    with tempfile.TemporaryDirectory() as td:
+        gp = Path(td) / "config.toml"
+        gp.write_text(existing_grok, encoding="utf-8")
+        r = install_grok_config("api_probe", "grok-4.5", "https://gw.example.com/v1",
+                                "responses", "我的站点", "GROK_API_KEY", "", 128000,
+                                None, True, path=gp)
+        check("写 config.toml 成功", r["ok"] and gp.exists(), f"-> {r.get('error')}")
+        check("记录了旧的 default", r["old_default"] == "grok-4.5", f"-> {r['old_default']!r}")
+        check("产生了备份", bool(r["backup"]) and Path(r["backup"]).exists())
+        gp.write_text("这不是 toml [[[", encoding="utf-8")
+        bad = install_grok_config("api_probe", "m", "https://gw/v1", path=gp)
+        check("坏 TOML 拒绝覆盖", bad["ok"] is False and "合法 TOML" in bad["error"],
+              f"-> {bad['error']}")
+        check("坏文件内容原样保留", gp.read_text(encoding="utf-8") == "这不是 toml [[[")
+
+        lp = Path(td) / "start-grok.bat"
+        lr = write_grok_launcher("GROK_API_KEY", "sk-x", lp, r"C:\g\grok.exe", r"C:\g")
+        body = lp.read_bytes() if lp.exists() else b""
+        check("Grok 启动脚本生成成功", lr["ok"] and bool(body), f"-> {lr.get('error')}")
+        check("启动脚本纯 ASCII", all(b < 128 for b in body))
+        check("启动脚本用 CRLF", b"\r\n" in body)
+        check("启动脚本设了 Key 与 GROK_HOME",
+              b'set "GROK_API_KEY=sk-x"' in body and b"GROK_HOME" in body)
+        badl = write_grok_launcher("GROK_API_KEY", "中文", Path(td) / "x.bat")
+        check("非 ASCII 拒绝写 .bat", badl["ok"] is False and "非 ASCII" in badl["error"])
+
+        stub_dir = Path(td) / "gstub"
+        stub_dir.mkdir()
+        stub = stub_dir / "grok.cmd"
+        stub.write_text('@echo off\r\necho {"result":"PONG","is_error":false}\r\n',
+                        encoding="ascii")
+        vr = verify_grok_cli("api_probe", "GROK_API_KEY", "sk-x", cli_path=str(stub),
+                             timeout=60)
+        check("Grok 端到端能解析 result 并识别 PONG", vr["ok"] is True,
+              f"-> {vr.get('error')} {vr.get('result')!r}")
+        stub.write_text('@echo off\r\necho {"result":"nope","is_error":true}\r\n',
+                        encoding="ascii")
+        vr2 = verify_grok_cli("api_probe", "GROK_API_KEY", "sk-x", cli_path=str(stub),
+                              timeout=60)
+        check("is_error=true 时判失败", vr2["ok"] is False and bool(vr2["error"]),
+              f"-> {vr2['error']!r}")
+        missing = verify_grok_cli("api_probe", "K", "sk", cli_path=str(Path(td) / "no.exe"),
+                                  timeout=5)
+        check("找不到 grok 时优雅失败",
+              missing["ok"] is False and "没找到" in missing["error"], f"-> {missing['error']}")
+        check("能找到备份文件", len(find_grok_backups(gp)) >= 1)
+
+    print("\n[15] 线程安全：worker 里不得访问 Tk（回归）")
+    try:
+        import ast as _ast
+        _src = Path(__file__).read_text(encoding="utf-8")
+        _tree = _ast.parse(_src)
+        _tk_attrs = set()
+        for _node in _ast.walk(_tree):
+            if isinstance(_node, _ast.Assign) and isinstance(_node.value, _ast.Call):
+                _fn = _node.value.func
+                if (isinstance(_fn, _ast.Attribute) and isinstance(_fn.value, _ast.Name)
+                        and _fn.value.id in ("tk", "ttk")):
+                    for _t in _node.targets:
+                        if (isinstance(_t, _ast.Attribute) and isinstance(_t.value, _ast.Name)
+                                and _t.value.id == "self"):
+                            _tk_attrs.add(_t.attr)
+
+        class _Audit(_ast.NodeVisitor):
+            def __init__(self):
+                self.stack = []
+                self.hits = []
+
+            def visit_FunctionDef(self, node):
+                self.stack.append(node.name)
+                self.generic_visit(node)
+                self.stack.pop()
+
+            def visit_Call(self, node):
+                f = node.func
+                if (isinstance(f, _ast.Attribute) and isinstance(f.value, _ast.Attribute)
+                        and isinstance(f.value.value, _ast.Name)
+                        and f.value.value.id == "self"
+                        and f.value.attr in _tk_attrs
+                        and any(n in ("work", "worker", "_worker") for n in self.stack)):
+                    self.hits.append((node.lineno, f.value.attr))
+                self.generic_visit(node)
+
+        _a = _Audit()
+        _a.visit(_tree)
+        check("worker 线程里没有 Tk 访问（否则会 RuntimeError 崩线程）",
+              not _a.hits, f"-> 行 {[h[0] for h in _a.hits]}")
+    except Exception as e:  # noqa: BLE001
+        check(f"（无法做 AST 审计：{e}）", False)
+
     print(f"\n结果：{ok_count} 通过 / {fail_count} 失败")
     return 1 if fail_count else 0
 
@@ -5597,6 +6531,7 @@ def uitest() -> int:
     import tempfile
     global CONFIG_PATH, CLAUDE_SETTINGS_PATH, CLAUDE_OUTPUT_DIR
     global CODEX_HOME, CODEX_CONFIG_PATH, CODEX_ENV_PATH
+    global GROK_HOME, GROK_CONFIG_PATH
 
     real_config_path = CONFIG_PATH
     CONFIG_PATH = Path(tempfile.mkdtemp(prefix="api_probe_cfg_")) / "cfg.json"
@@ -5614,6 +6549,12 @@ def uitest() -> int:
     CODEX_HOME = _codex_home_tmp
     CODEX_CONFIG_PATH = _codex_home_tmp / "config.toml"
     CODEX_ENV_PATH = _codex_home_tmp / ".env"
+    # Grok 同理：绝不碰用户真实的 ~/.grok
+    real_grok_home = GROK_HOME
+    real_grok_config = GROK_CONFIG_PATH
+    _grok_home_tmp = Path(tempfile.mkdtemp(prefix="api_probe_grokhome_"))
+    GROK_HOME = _grok_home_tmp
+    GROK_CONFIG_PATH = _grok_home_tmp / "config.toml"
 
     enable_dpi_awareness()
     fails = []
@@ -5843,7 +6784,7 @@ def uitest() -> int:
         # ---- Claude Code 接入页 ----
         check("Claude Code 标签页已创建", app.tab_claude is not None)
         check("Codex 标签页已创建", app.tab_codex is not None)
-        check("标签页总数为 6", len(app.nb.tabs()) == 6, f"-> {len(app.nb.tabs())}")
+        check("标签页总数为 7", len(app.nb.tabs()) == 7, f"-> {len(app.nb.tabs())}")
         check("模型映射有五项", len(app.cc_model_vars) == 5, f"-> {list(app.cc_model_vars)}")
 
         srv_cc, base_cc = _mock_server("anthropic")
@@ -6053,6 +6994,85 @@ def uitest() -> int:
                   app4.var_cc_key.get() == "Anthropic Key"
                   and app4.var_codex_key.get() == "OpenAI Key")
             root4.destroy()
+
+            # ---- Grok Build 页 ----
+            check("Grok 标签页已创建", app.tab_grok is not None)
+            check("门禁：还没探测协议时不能接入", app.grok_ready()[0] is False,
+                  f"-> {app.grok_ready()[1]}")
+            check("Grok 接入按钮默认禁用", str(app.btn_grok_install["state"]) == "disabled")
+            app._select_site("多Key站")
+            app.var_url.set(base_cc)          # mock 站：Anthropic + Responses + Chat 都实现了
+            app.var_key.set("sk-mock")
+            rec_gk = app._record_for("多Key站")
+            upsert_site_key(rec_gk, "Mock Key", "sk-mock", "auto")   # 让 Grok 页拿到可用的 Key
+            app._refresh_cli_key_combos()
+            app.var_grok_key.set("Mock Key")
+            app.grok_refresh_context()
+            check("Grok 页挑到了模型（候选里优先 claude 系）",
+                  bool(app.var_grok_model.get()), f"-> {app.var_grok_model.get()!r}")
+            check("base_url 自动补了 /v1", app.var_grok_base.get().endswith("/v1"),
+                  f"-> {app.var_grok_base.get()}")
+            check("Grok 页的 Key 下拉已填", app.var_grok_key.get() != "",
+                  f"-> {app.var_grok_key.get()!r}")
+            check("Grok 页取到的是这把 Key 的值",
+                  app._key_value_for(app.var_grok_key, "") == "sk-mock",
+                  f"-> {app._key_value_for(app.var_grok_key, '')!r}")
+
+            app.grok_check()
+            wait_until(lambda: not app.busy, root, timeout=90)
+            check("协议探测通过", (app.grok_state or {}).get("ok") is True,
+                  f"-> {(app.grok_state or {}).get('verdict')}")
+            check("优先选了 Chat Completions（Grok 默认协议）",
+                  (app.grok_state or {}).get("backend") == "chat_completions",
+                  f"-> {(app.grok_state or {}).get('backend')}")
+            check("探测结果渲染到表格", len(app.tv_grok.get_children()) >= 5,
+                  f"-> {len(app.tv_grok.get_children())}")
+            check("门禁解锁", app.grok_ready()[0] is True, f"-> {app.grok_ready()[1]}")
+            check("Grok 接入按钮已可点", str(app.btn_grok_install["state"]) == "normal")
+
+            # 一键接入：写临时 ~/.grok/config.toml + 测试用环境变量（不碰真实配置）
+            tvar2 = "API_PROBE_GROK_UITEST"
+            delete_user_env_var(tvar2)
+            old_grok_env = app.var_grok_envkey.get()
+            app.var_grok_envkey.set(tvar2)
+            app.grok_write_config.set(True)
+            app.grok_write_sysenv.set(True)
+            app.grok_write_inline.set(False)
+            app.grok_write_launcher.set(True)
+            app.grok_run_verify.set(False)     # 不真去调 grok CLI
+            grok_ok, grok_why = app.grok_ready()
+            check("一键接入前门禁通过（否则会弹窗阻塞测试）", grok_ok, f"-> {grok_why}")
+            if grok_ok:
+                app.grok_install()
+                wait_until(lambda: not app.busy, root, timeout=60)
+            check("写出了 ~/.grok/config.toml（临时目录）", GROK_CONFIG_PATH.exists(),
+                  f"-> {GROK_CONFIG_PATH}")
+            gtxt = GROK_CONFIG_PATH.read_text(encoding="utf-8")
+            check("配置里有 [model.api_probe]（不带引号）", "[model.api_probe]" in gtxt)
+            check("配置里写了 api_backend", "api_backend" in gtxt)
+            check("配置里用 env_key 而不是明文 key",
+                  f'env_key = "{tvar2}"' in gtxt and "sk-mock" not in gtxt)
+            check("配置里 base_url 带 /v1", "base_url" in gtxt and "/v1" in gtxt)
+            try:
+                import tomllib
+                check("写出来的 config.toml 是合法 TOML",
+                      tomllib.loads(gtxt)["model"]["api_probe"]["api_backend"]
+                      == "chat_completions")
+            except ImportError:
+                check("（无 tomllib，跳过 TOML 校验）", True)
+            check("写入了用户级环境变量（测试名）", read_user_env_var(tvar2) == "sk-mock",
+                  f"-> {read_user_env_var(tvar2)!r}")
+            gbats = [p for p in CLAUDE_OUTPUT_DIR.rglob("*.bat") if "grok" in p.name.lower()]
+            check("生成了 Grok 启动脚本", bool(gbats), f"-> {gbats}")
+            check("Grok 启动脚本纯 ASCII",
+                  all(all(b < 128 for b in p.read_bytes()) for p in gbats))
+            check("Grok 日志有输出",
+                  "一键接入 Grok 完成" in app.txt_grok.get("1.0", "end-1c"))
+            delete_user_env_var(tvar2)
+            check("测试用的 Grok 环境变量已清理", read_user_env_var(tvar2) == "")
+            app.var_grok_envkey.set(old_grok_env)
+            check("测试全程用隔离的 GROK_HOME",
+                  "api_probe_grokhome_" in str(GROK_CONFIG_PATH), f"-> {GROK_CONFIG_PATH}")
         finally:
             srv_cc.shutdown()
     except Exception as e:  # noqa: BLE001
@@ -6071,6 +7091,8 @@ def uitest() -> int:
         CODEX_HOME = real_codex_home
         CODEX_CONFIG_PATH = real_codex_config
         CODEX_ENV_PATH = real_codex_env
+        GROK_HOME = real_grok_home
+        GROK_CONFIG_PATH = real_grok_config
 
     if fails:
         print(f"界面流程自检失败 {len(fails)} 项：{fails}")
@@ -6080,7 +7102,7 @@ def uitest() -> int:
 
 
 # =====================================================================
-# 十一、命令行
+# 十二、命令行
 # =====================================================================
 
 def cli_probe(args) -> int:
@@ -6156,6 +7178,29 @@ def cli_probe(args) -> int:
                                           chk["wire_api"] or "responses", "API Probe"))
         return 0 if chk["ok"] else 2
 
+    if args.grok_check:
+        base = normalize_base(args.url)
+        ach = check_anthropic_channel(base, args.key, args.model or "", timeout=args.timeout,
+                                      verify=not args.no_verify, log=log)
+        och = check_openai_channel(base, args.key, args.model or "", timeout=args.timeout,
+                                   verify=not args.no_verify, log=log, prefer="chat")
+        backend = backend_from_channels(bool(ach.get("ok")), och.get("wire_api") or "")
+        out = {"anthropic": ach, "openai": och,
+               "backend": backend, "ok": bool(ach.get("ok") or och.get("ok"))}
+        if args.json:
+            print(json.dumps(out, ensure_ascii=False, indent=2))
+            return 0 if out["ok"] else 2
+        print()
+        print(f"Anthropic Messages : {ach.get('verdict')}")
+        print(f"OpenAI 通道        : {och.get('verdict')}")
+        print(f"→ Grok api_backend : {backend}（{BACKEND_LABEL.get(backend, '')}）")
+        print(f"→ Grok base_url    : {grok_base_url_for_gateway(base)}")
+        print("\n可写进 ~/.grok/config.toml 的片段（Key 用 env_key，不落配置文件）：")
+        print(render_grok_model_block(GROK_MODEL_KEY, args.model or "<模型 id>",
+                                      grok_base_url_for_gateway(base), backend,
+                                      "API Probe", env_key=GROK_ENV_KEY_DEFAULT))
+        return 0 if out["ok"] else 2
+
     res = probe(args.url, args.key, model=args.model or "", timeout=args.timeout,
                 verify=not args.no_verify, deep=not args.no_deep, log=log)
     if args.json:
@@ -6210,6 +7255,8 @@ def main(argv=None) -> int:
                     help="检测网关是否实现 Anthropic Messages 协议（Claude Code 直连的前提）")
     ap.add_argument("--codex-check", action="store_true",
                     help="检测网关的 OpenAI 通道（/v1/responses 与 /v1/chat/completions），判断 Codex 的 wire_api")
+    ap.add_argument("--grok-check", action="store_true",
+                    help="为 Grok Build 选协议：测三条通道并给出 api_backend 与配置片段")
     ap.add_argument("--selftest", action="store_true", help="运行内置自检")
     ap.add_argument("--uitest", action="store_true", help="运行图形界面构建自检")
     args = ap.parse_args(argv)
