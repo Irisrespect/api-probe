@@ -6475,47 +6475,58 @@ def selftest() -> int:
         check("能找到备份文件", len(find_grok_backups(gp)) >= 1)
 
     print("\n[15] 线程安全：worker 里不得访问 Tk（回归）")
-    try:
-        import ast as _ast
-        _src = Path(__file__).read_text(encoding="utf-8")
-        _tree = _ast.parse(_src)
-        _tk_attrs = set()
-        for _node in _ast.walk(_tree):
-            if isinstance(_node, _ast.Assign) and isinstance(_node.value, _ast.Call):
-                _fn = _node.value.func
-                if (isinstance(_fn, _ast.Attribute) and isinstance(_fn.value, _ast.Name)
-                        and _fn.value.id in ("tk", "ttk")):
-                    for _t in _node.targets:
-                        if (isinstance(_t, _ast.Attribute) and isinstance(_t.value, _ast.Name)
-                                and _t.value.id == "self"):
-                            _tk_attrs.add(_t.attr)
+    if getattr(sys, "frozen", False):
+        # 打包成 exe 后没有 .py 源码（只有归档里的 pyc），本项只在源码模式执行
+        check("（打包版没有源码文件，跳过 AST 审计；源码模式下已覆盖）", True)
+    else:
+        def _audit_worker_tk() -> list:
+            """扫源码：找出 work()/worker 里对 Tk 对象的访问，返回 [(行号, 属性)]。"""
+            import ast as _ast
+            _src = Path(__file__).read_text(encoding="utf-8")
+            _tree = _ast.parse(_src)
+            _tk_attrs = set()
+            for _node in _ast.walk(_tree):
+                if isinstance(_node, _ast.Assign) and isinstance(_node.value, _ast.Call):
+                    _fn = _node.value.func
+                    if (isinstance(_fn, _ast.Attribute) and isinstance(_fn.value, _ast.Name)
+                            and _fn.value.id in ("tk", "ttk")):
+                        for _t in _node.targets:
+                            if (isinstance(_t, _ast.Attribute)
+                                    and isinstance(_t.value, _ast.Name)
+                                    and _t.value.id == "self"):
+                                _tk_attrs.add(_t.attr)
 
-        class _Audit(_ast.NodeVisitor):
-            def __init__(self):
-                self.stack = []
-                self.hits = []
+            class _Audit(_ast.NodeVisitor):
+                def __init__(self):
+                    self.stack = []
+                    self.hits = []
 
-            def visit_FunctionDef(self, node):
-                self.stack.append(node.name)
-                self.generic_visit(node)
-                self.stack.pop()
+                def visit_FunctionDef(self, node):
+                    self.stack.append(node.name)
+                    self.generic_visit(node)
+                    self.stack.pop()
 
-            def visit_Call(self, node):
-                f = node.func
-                if (isinstance(f, _ast.Attribute) and isinstance(f.value, _ast.Attribute)
-                        and isinstance(f.value.value, _ast.Name)
-                        and f.value.value.id == "self"
-                        and f.value.attr in _tk_attrs
-                        and any(n in ("work", "worker", "_worker") for n in self.stack)):
-                    self.hits.append((node.lineno, f.value.attr))
-                self.generic_visit(node)
+                def visit_Call(self, node):
+                    f = node.func
+                    if (isinstance(f, _ast.Attribute)
+                            and isinstance(f.value, _ast.Attribute)
+                            and isinstance(f.value.value, _ast.Name)
+                            and f.value.value.id == "self"
+                            and f.value.attr in _tk_attrs
+                            and any(n in ("work", "worker", "_worker") for n in self.stack)):
+                        self.hits.append((node.lineno, f.value.attr))
+                    self.generic_visit(node)
 
-        _a = _Audit()
-        _a.visit(_tree)
-        check("worker 线程里没有 Tk 访问（否则会 RuntimeError 崩线程）",
-              not _a.hits, f"-> 行 {[h[0] for h in _a.hits]}")
-    except Exception as e:  # noqa: BLE001
-        check(f"（无法做 AST 审计：{e}）", False)
+            _a = _Audit()
+            _a.visit(_tree)
+            return _a.hits
+
+        try:
+            _hits = _audit_worker_tk()
+            check("worker 线程里没有 Tk 访问（否则会 RuntimeError 崩线程）",
+                  not _hits, f"-> 行 {[h[0] for h in _hits]}")
+        except Exception as e:  # noqa: BLE001
+            check(f"（无法做 AST 审计：{e}）", False)
 
     print(f"\n结果：{ok_count} 通过 / {fail_count} 失败")
     return 1 if fail_count else 0
