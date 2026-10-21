@@ -302,7 +302,8 @@ def ssl_context(verify: bool) -> ssl.SSLContext:
 #   ① 允许手动指定出口（跟随系统 / 直连 / 自定义代理）；
 #   ② 一条出口不通就自动换另一条，并把这个决定记下来，后续同类请求直接走通的。
 # ---------------------------------------------------------------------
-NET = {"proxy_mode": "auto", "proxy_url": ""}     # auto | direct | custom
+NET = {"proxy_mode": "auto", "proxy_url": ""}
+# proxy_mode：auto = 系统代理 ∥ 直连（界面默认）；custom = 额外代理 ∥ 直连；direct = 仅直连（命令行 --direct）
 PROXY_MODE_LABELS = {"auto": "跟随系统代理", "direct": "直连", "custom": "自定义代理"}
 _TRANSPORT_PREF: dict[str, str] = {}               # host -> 实测能用的出口
 NET_FALLBACKS: dict[str, str] = {}                 # host -> 换出口的说明
@@ -3196,21 +3197,14 @@ class ProbeApp:
 
         row3 = ttk.Frame(top)
         row3.pack(fill="x", padx=8, pady=(0, 8))
-        ttk.Label(row3, text="出口").pack(side="left", padx=(0, 4))
-        self.var_proxy_mode = tk.StringVar(value=PROXY_MODE_LABELS["auto"])
-        self.cmb_proxy = ttk.Combobox(row3, textvariable=self.var_proxy_mode, width=13,
-                                      state="readonly",
-                                      values=[PROXY_MODE_LABELS[m] for m in ("auto", "direct",
-                                                                             "custom")])
-        self.cmb_proxy.pack(side="left")
-        self.cmb_proxy.bind("<<ComboboxSelected>>", lambda e: self._on_proxy_change())
+        ttk.Label(row3, text="额外代理").pack(side="left", padx=(0, 4))
         self.var_proxy_url = tk.StringVar()
         self.ent_proxy = ttk.Entry(row3, textvariable=self.var_proxy_url, width=20,
                                    font=self.mono_font)
         self.ent_proxy.pack(side="left", padx=(4, 0))
         self.ent_proxy.bind("<FocusOut>", lambda e: self._on_proxy_change())
         self.ent_proxy.bind("<Return>", lambda e: self._on_proxy_change())
-        ttk.Label(row3, text="（系统代理挂了就切直连）",
+        ttk.Label(row3, text="（默认「系统代理 ∥ 直连」并行；填了就改走这条，可留空）",
                   style="Hint.TLabel").pack(side="left", padx=(4, 0))
         self.var_verify = tk.BooleanVar(value=True)
         ttk.Checkbutton(row3, text="校验 TLS 证书（自签站可取消）",
@@ -5293,9 +5287,8 @@ class ProbeApp:
             self.var_deep.set(bool(cfg.get("deep_check", True)))
             self.var_only_main.set(bool(cfg.get("only_mainstream", False)))
             self.var_workers.set(str(cfg.get("workers", 2)))
-            mode = str(cfg.get("proxy_mode") or "auto")
-            if mode in PROXY_MODE_LABELS:
-                self.var_proxy_mode.set(PROXY_MODE_LABELS[mode])
+            # v1.9.1 早期版本存过 proxy_mode（auto/direct/custom），现在只看 proxy_url：
+            # 有地址就是“额外代理”，没有就是“系统代理 ∥ 直连”；旧的 direct 偏好不再保留
             self.var_proxy_url.set(str(cfg.get("proxy_url") or ""))
             geo = str(cfg.get("geometry") or "")
             if re.fullmatch(r"\d+x\d+([+-]\d+[+-]\d+)?", geo):
@@ -5514,11 +5507,8 @@ class ProbeApp:
 
     # ---------------- 网络出口 ----------------
     def _proxy_mode(self) -> str:
-        label = (self.var_proxy_mode.get() if hasattr(self, "var_proxy_mode") else "") or ""
-        for mode, text in PROXY_MODE_LABELS.items():
-            if label == text:
-                return mode
-        return "auto"
+        """界面只区分两种：填了额外代理就走它，没填就让系统代理 ∥ 直连 竞速。"""
+        return "custom" if normalize_proxy_url(self.var_proxy_url.get()) else "auto"
 
     def _apply_net(self) -> None:
         """把界面上的出口设置应用到所有请求。"""
@@ -5526,20 +5516,14 @@ class ProbeApp:
             apply_net_config(self._proxy_mode(), self.var_proxy_url.get())
         except Exception:
             pass
-        try:
-            custom = self._proxy_mode() == "custom"
-            self.ent_proxy.configure(state="normal" if custom else "disabled")
-        except Exception:
-            pass
 
     def _on_proxy_change(self):
         self._apply_net()
-        mode = self._proxy_mode()
-        if mode == "custom" and not normalize_proxy_url(self.var_proxy_url.get()):
-            self._set_status("自定义代理需要填地址，例如 127.0.0.1:7897")
+        url = normalize_proxy_url(self.var_proxy_url.get())
+        if url:
+            self._set_status(f"额外代理已启用：{url}（与直连并行，先回来的算数）")
         else:
-            self._set_status(f"出口已切换：{PROXY_MODE_LABELS[mode]}"
-                             + ("（≠ 系统代理，下次请求用这个）" if mode != "auto" else ""))
+            self._set_status("额外代理已清空：系统代理 ∥ 直连 并行")
         self._schedule_save(200)
 
     # ---------------- 第 1 步：拉取模型列表 ----------------
@@ -7049,6 +7033,18 @@ def uitest() -> int:
         app = ProbeApp(root)
         root.update()
         check("界面构建成功", True)
+
+        # ---- 出口：没有下拉框了，只有一个可选的额外代理 ----
+        check("出口不再是一排下拉框", not hasattr(app, "cmb_proxy"))
+        check("额外代理留空 → 系统代理 ∥ 直连", app._proxy_mode() == "auto")
+        app.var_proxy_url.set("127.0.0.1:7897")
+        app._apply_net()
+        check("填了额外代理 → 立刻生效", NET["proxy_mode"] == "custom"
+              and NET["proxy_url"] == "http://127.0.0.1:7897",
+              f"-> {NET}")
+        app.var_proxy_url.set("")
+        app._apply_net()
+        check("清空后回到并行模式", NET["proxy_mode"] == "auto", f"-> {NET}")
 
         # ---- 第 1 步：拉模型列表 ----
         app.var_url.set(base)
