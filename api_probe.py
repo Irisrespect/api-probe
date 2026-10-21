@@ -352,7 +352,7 @@ def build_opener(verify: bool, proxy=None):
 
 
 def _transport_chain(host: str) -> list[tuple[str, dict | None]]:
-    """按当前设置给出尝试顺序：首选出口 → 兜底出口。"""
+    """给出这个 host 的候选出口；第一条是「首选」，其余是并行竞速的对手。"""
     mode = NET.get("proxy_mode") or "auto"
     if mode == "direct":
         return [("direct", {})]
@@ -368,36 +368,142 @@ def _transport_chain(host: str) -> list[tuple[str, dict | None]]:
     return chain
 
 
-def open_url(url: str, make_request, timeout: float, verify: bool):
-    """按出口策略打开一次请求，返回 (response, 实际用的出口)。
+def _transport_error(e: Exception, via: str, timeout: float) -> TransportError:
+    reason = getattr(e, "reason", e)
+    text = reason if isinstance(reason, str) else f"{type(reason).__name__}: {reason}"
+    timed = (isinstance(e, (socket.timeout, TimeoutError))
+             or isinstance(reason, (socket.timeout, TimeoutError))
+             or "timed out" in text.lower())
+    return TransportError(f"超时（>{timeout:g}s）" if timed else f"网络错误: {text}",
+                          via=via, timed_out=timed)
 
-    首选出错（连不上 / 握手超时）时换另一条路重试；HTTP 状态码错误原样抛出，
-    由调用方按 HTTPError 处理。
+
+def _open_once(make_request, timeout: float, verify: bool, via: str, pmap):
+    """用指定出口打开一次请求。HTTP 状态码错误照抛，网络层失败包成 TransportError。"""
+    try:
+        return build_opener(verify, pmap).open(make_request(), timeout=timeout)
+    except urllib.error.HTTPError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise _transport_error(e, via, timeout) from e
+
+
+def _close_quietly(resp) -> None:
+    """竞速里慢一步的那种“也成功了但用不上”的响应，及时关掉别占连接。"""
+    try:
+        resp.close()
+    except Exception:  # noqa: BLE001
+        try:
+            resp.__exit__(None, None, None)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _remember_exit(host: str, via: str, first_via: str) -> None:
+    """记住这个站实际用的出口；顺带留一句“为什么不是首选”。"""
+    if not host:
+        return
+    _TRANSPORT_PREF[host] = via
+    if via != first_via:
+        NET_FALLBACKS[host] = (f"{PROXY_MODE_LABELS.get(first_via, first_via)} 没能先返回，"
+                               f"已改用{PROXY_MODE_LABELS.get(via, via)}（两条出口并行试过）")
+
+
+def open_url(url: str, make_request, timeout: float, verify: bool, race: bool = True):
+    """打开一次请求，返回 (response, 实际用的出口)。
+
+    默认让「首选出口」和「直连」同时开跑，谁先给出响应就用谁：
+    - 赢的那条立刻返回，输的那条到点自己超时，不打印、不等待；
+    - 该 host 用哪条出口会被记住，后续请求直接走它，不再重复竞速；
+    - race=False 时退回顺序尝试（给真实的生成请求用，避免重复计费）。
+    HTTP 状态码错误原样抛出，由调用方按 HTTPError 处理。
     """
     host = (urllib.parse.urlsplit(url).hostname or "").lower()
     chain = _transport_chain(host)
-    last: TransportError | None = None
-    for i, (via, pmap) in enumerate(chain):
+    primed = _TRANSPORT_PREF.get(host)
+    if primed:
+        chain = [c for c in chain if c[0] == primed] or chain
+    first_via = chain[0][0]
+
+    if len(chain) == 1 or not race:
+        last: TransportError | None = None
+        for via, pmap in chain:
+            try:
+                resp = _open_once(make_request, timeout, verify, via, pmap)
+            except urllib.error.HTTPError:
+                raise
+            except TransportError as e:
+                last = e
+                continue
+            _remember_exit(host, via, first_via)
+            return resp, via
+        raise last or TransportError("网络错误", via=first_via)
+
+    # ---- 并行竞速：两条出口同时发，谁先回来用谁 ----
+    results: queue.Queue = queue.Queue()
+    state = {"done": False}
+    lock = threading.Lock()
+
+    def worker(via: str, pmap) -> None:
+        item = {"via": via, "resp": None, "exc": None}
         try:
-            return build_opener(verify, pmap).open(make_request(), timeout=timeout), via
-        except urllib.error.HTTPError:
-            raise
+            item["resp"] = _open_once(make_request, timeout, verify, via, pmap)
+        except urllib.error.HTTPError as e:
+            item["exc"] = e
+        except TransportError as e:
+            item["exc"] = e
         except Exception as e:  # noqa: BLE001
-            reason = getattr(e, "reason", e)
-            text = reason if isinstance(reason, str) else f"{type(reason).__name__}: {reason}"
-            timed = (isinstance(e, (socket.timeout, TimeoutError))
-                     or isinstance(reason, (socket.timeout, TimeoutError))
-                     or "timed out" in text.lower())
-            last = TransportError(f"超时（>{timeout:g}s）" if timed else f"网络错误: {text}",
-                                  via=via, timed_out=timed)
-            if i + 1 < len(chain):
-                nxt = chain[i + 1][0]
-                _TRANSPORT_PREF[host] = nxt
-                NET_FALLBACKS[host] = (
-                    f"{PROXY_MODE_LABELS.get(via, via)} 连不上（{last.message}），"
-                    f"已自动改用{PROXY_MODE_LABELS.get(nxt, nxt)}")
-            continue
-    raise last or TransportError("网络错误", via=chain[0][0] if chain else "")
+            item["exc"] = _transport_error(e, via, timeout)
+        with lock:
+            if state["done"]:
+                if item["resp"] is not None:
+                    _close_quietly(item["resp"])
+                return
+            results.put(item)
+
+    for via, pmap in chain:
+        threading.Thread(target=worker, args=(via, pmap), daemon=True).start()
+
+    deadline = time.perf_counter() + timeout + 1.0
+    errors: list[TransportError] = []
+    http_err = None
+    winner = None
+    finished = 0
+    try:
+        while finished < len(chain):
+            left = deadline - time.perf_counter()
+            if left <= 0:
+                break
+            try:
+                item = results.get(timeout=left)
+            except queue.Empty:
+                break
+            finished += 1
+            if item["resp"] is not None:
+                winner = item
+                break                     # 先跑出来的就是它，另一条不等了
+            if isinstance(item["exc"], urllib.error.HTTPError):
+                http_err = http_err or item["exc"]
+            elif item["exc"] is not None:
+                errors.append(item["exc"])
+    finally:
+        with lock:
+            state["done"] = True
+        while True:                       # 收尾：可能还有到得太晚的响应躺在队列里
+            try:
+                late = results.get_nowait()
+            except queue.Empty:
+                break
+            if late.get("resp") is not None:
+                _close_quietly(late["resp"])
+
+    if winner is not None:
+        _remember_exit(host, winner["via"], first_via)
+        return winner["resp"], winner["via"]
+    if http_err is not None:
+        raise http_err
+    raise errors[0] if errors else TransportError(f"超时（>{timeout:g}s）", via=first_via,
+                                                 timed_out=True)
 
 
 def apply_net_config(mode: str = "", url: str = "") -> None:
@@ -520,7 +626,7 @@ class HttpResult:
 
 def http_request(method: str, url: str, headers: dict | None = None, payload=None,
                  timeout: float = DEFAULT_TIMEOUT, verify: bool = True,
-                 read_limit: int = 4_000_000) -> HttpResult:
+                 read_limit: int = 4_000_000, race: bool = True) -> HttpResult:
     hdrs = {k: v for k, v in (headers or {}).items() if v is not None}
     hdrs.setdefault("User-Agent", UA)
     hdrs.setdefault("Accept", "application/json")
@@ -531,7 +637,7 @@ def http_request(method: str, url: str, headers: dict | None = None, payload=Non
     req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
     t0 = time.perf_counter()
     try:
-        resp, via = open_url(url, lambda: req, timeout, verify)
+        resp, via = open_url(url, lambda: req, timeout, verify, race=race)
     except urllib.error.HTTPError as e:
         raw = b""
         try:
@@ -576,7 +682,7 @@ class SseCollector:
 
 def stream_generate(url: str, headers: dict, payload: dict, feeder, timeout: float,
                     verify: bool, stop_event: threading.Event | None = None,
-                    max_text: int = 64) -> SseCollector:
+                    max_text: int = 64, race: bool = True) -> SseCollector:
     """发一次流式请求，用 feeder 解析 SSE，返回 SseCollector。"""
     col = SseCollector()
     hdrs = {k: v for k, v in (headers or {}).items() if v is not None}
@@ -587,7 +693,7 @@ def stream_generate(url: str, headers: dict, payload: dict, feeder, timeout: flo
     req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
     t0 = time.perf_counter()
     try:
-        resp, col.via = open_url(url, lambda: req, timeout, verify)
+        resp, col.via = open_url(url, lambda: req, timeout, verify, race=race)
     except urllib.error.HTTPError as e:
         raw = b""
         try:
@@ -1025,8 +1131,11 @@ def probe_site(base_input: str, key: str, timeout: float = DEFAULT_TIMEOUT,
                 hdrs = auth_headers(proto, key, scheme)
                 r = http_request("GET", u, headers=hdrs, timeout=timeout, verify=verify)
                 attempt = {"protocol": proto, "url": u, "status": r.status,
-                           "ms": r.latency_ms, "error": r.error}
-                L(f"  [{spec['label']}] GET {u} -> {r.status or r.error} {r.latency_ms}ms")
+                           "ms": r.latency_ms, "error": r.error, "via": r.via}
+                note = ("" if (not r.via or NET.get("proxy_mode") == "direct")
+                        else f"（{PROXY_MODE_LABELS.get(r.via, r.via)}）")
+                L(f"  [{spec['label']}] GET {u} -> {r.status or r.error} "
+                  f"{r.latency_ms}ms{note}")
                 if r.ok:
                     models = spec["parse_models"](r.json)
                     if models or isinstance(r.json, (dict, list)):
@@ -1121,8 +1230,9 @@ def probe_generate(res: dict, key: str, model: str, timeout: float = DEFAULT_TIM
 
     L(f"[1/2] 生成测试（流式）: 协议={res.get('protocol_label')} 请求模型 = {used}")
     url, hdrs, payload = generation_request(res["protocol"], base, key, used, stream=True)
+    # race=False：这是会真扣费的生成请求，不能两条出口各发一次
     col = stream_generate(url, hdrs, payload, PROTOCOLS[res["protocol"]]["feed"],
-                          timeout=timeout, verify=verify, stop_event=stop_event)
+                          timeout=timeout, verify=verify, stop_event=stop_event, race=False)
     res["gen_ms"] = col.total_ms
     res["http_status"] = col.status or res["http_status"]
     attempted_alt = False
@@ -1134,7 +1244,7 @@ def probe_generate(res: dict, key: str, model: str, timeout: float = DEFAULT_TIM
         payload2["max_completion_tokens"] = 8
         L("  该模型不接受 max_tokens，改用 max_completion_tokens 重试")
         col = stream_generate(url, hdrs, payload2, feed_openai, timeout=timeout,
-                              verify=verify, stop_event=stop_event)
+                              verify=verify, stop_event=stop_event, race=False)
         res["gen_ms"] = col.total_ms
     if col.first_ms is not None:
         res["first_token_ms"] = col.first_ms
@@ -1152,7 +1262,7 @@ def probe_generate(res: dict, key: str, model: str, timeout: float = DEFAULT_TIM
         L("  流式未拿到内容，改用非流式重试一次")
         url2, hdrs2, payload2 = generation_request(res["protocol"], base, key, used, stream=False)
         r2 = http_request("POST", url2, headers=hdrs2, payload=payload2, timeout=timeout,
-                          verify=verify)
+                          verify=verify, race=False)
         res["http_status"] = r2.status or res["http_status"]
         L(f"  POST {url2} -> {r2.status or r2.error} {r2.latency_ms}ms")
         if r2.ok:
@@ -1191,7 +1301,8 @@ def probe_generate(res: dict, key: str, model: str, timeout: float = DEFAULT_TIM
         u3, h3, p3 = generation_request(res["protocol"], base, key, used, stream=False)
         if res["protocol"] == "openai":
             p3["max_tokens"] = 1
-        r3 = http_request("POST", u3, headers=h3, payload=p3, timeout=timeout, verify=verify)
+        r3 = http_request("POST", u3, headers=h3, payload=p3, timeout=timeout, verify=verify,
+                          race=False)
         L(f"[2/2] 深度检测（非流式取 usage）: POST {u3} -> {r3.status or r3.error} {r3.latency_ms}ms")
         if r3.ok:
             rm, usage = parse_nonstream_model_usage(res["protocol"], r3.json)
@@ -6747,12 +6858,18 @@ def selftest() -> int:
     check("direct 模式只有一条路", _transport_chain("example.com") == [("direct", {})])
     apply_net_config("auto")
 
-    # 用假 opener 验证「第一条出口挂了 → 自动换直连」，不依赖外网
+    # 用假 opener 验证「两条出口并行，谁先回来用谁」——不依赖外网
     class _FakeResp:
         status, reason, headers = 200, "OK", {}
 
+        def __init__(self):
+            self.closed = False
+
         def read(self, n=-1):
             return b'{"data":[]}'
+
+        def close(self):
+            self.closed = True
 
         def __enter__(self):
             return self
@@ -6762,15 +6879,19 @@ def selftest() -> int:
 
     real_build = build_opener
     seen: list = []
+    slow_made: list = []
 
     def fake_build(verify, proxy=None):
         seen.append(proxy)
 
         class _Opener:
             def open(self, req, timeout=None):
-                if proxy:                      # 模拟代理端口不通
-                    raise urllib.error.URLError(socket.timeout("timed out"))
-                return _FakeResp()
+                if proxy:                      # 代理那条：慢半拍但最终也能成
+                    time.sleep(0.5)
+                    resp = _FakeResp()
+                    slow_made.append(resp)
+                    return resp
+                return _FakeResp()             # 直连那条：立刻回
 
         return _Opener()
 
@@ -6779,14 +6900,46 @@ def selftest() -> int:
         NET_FALLBACKS.clear()
         _TRANSPORT_PREF.clear()
         apply_net_config("custom", "127.0.0.1:9")
+        t0 = time.perf_counter()
         r = http_request("GET", "https://relay.example.com/v1/models", timeout=5)
-        check("首选出口失败后自动用直连重试并成功", r.ok and r.status == 200,
+        elapsed = time.perf_counter() - t0
+        check("先回来的那条立刻返回，不等慢的那条", elapsed < 0.3, f"-> {elapsed:.2f}s")
+        check("用的是先回来的直连", r.ok and r.via == "direct", f"-> {r.via} {r.error}")
+        check("两条出口是同时开跑的", len(seen) == 2, f"-> {seen}")
+        time.sleep(0.8)
+        check("慢一步（也成功了）的那条被静默关掉，不占连接",
+              bool(slow_made) and slow_made[0].closed, f"-> {len(slow_made)} 条")
+        check("出口选择被记下来，可以提示用户", bool(NET_FALLBACKS), f"-> {NET_FALLBACKS}")
+        seen.clear()
+        http_request("GET", "https://relay.example.com/v1/models", timeout=5)
+        check("记住出口后不再重复竞速（只开一条）", len(seen) == 1, f"-> {len(seen)} 条")
+        check("后续请求首选就是胜出的出口",
+              _transport_chain("relay.example.com")[0][0] == "direct",
+              f"-> {_transport_chain('relay.example.com')}")
+    finally:
+        globals()["build_opener"] = real_build
+        apply_net_config("auto")
+        _TRANSPORT_PREF.clear()
+        NET_FALLBACKS.clear()
+
+    # 另一条路彻底不通时也不能报错
+    def broken_build(verify, proxy=None):
+        class _Opener:
+            def open(self, req, timeout=None):
+                if proxy:
+                    raise urllib.error.URLError(socket.timeout("timed out"))
+                return _FakeResp()
+
+        return _Opener()
+
+    globals()["build_opener"] = broken_build
+    try:
+        NET_FALLBACKS.clear()
+        _TRANSPORT_PREF.clear()
+        apply_net_config("custom", "127.0.0.1:9")
+        r = http_request("GET", "https://relay2.example.com/v1/models", timeout=5)
+        check("代理直接报错时，直连照样把结果带回来", r.ok and r.via == "direct",
               f"-> {r.status} {r.error}")
-        check("结果里记录了实际出口是 direct", r.via == "direct", f"-> {r.via}")
-        check("两条出口都被试过（代理 → 直连）", len(seen) == 2, f"-> {seen}")
-        check("切换原因被记下来，可以提示用户", bool(NET_FALLBACKS), f"-> {NET_FALLBACKS}")
-        check("后续同类请求直接走直连（不再白等一次）",
-              _transport_chain("relay.example.com")[0][0] == "direct")
     finally:
         globals()["build_opener"] = real_build
         apply_net_config("auto")
