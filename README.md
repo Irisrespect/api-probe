@@ -1,4 +1,4 @@
-# API 中转站测活工具（api-probe） v1.9.0
+# API 中转站测活工具（api-probe） v1.9.1
 
 单文件 Windows 桌面小工具，一条线走完：**输入地址+Key → 探测模型 → 测能不能跑得动 → 接入 Claude Code / Codex / Grok Build**。
 沿途把「协议族、首字延迟、疑似掺水」等信息摊开给你看。
@@ -19,11 +19,12 @@
 | 6 | 批量巡检 | 一次跑一堆站点（多 Key 的站点每把各一行），并发可调，导出 CSV/JSON 做横向对比 |
 | 7 | 持久化与安全 | 站点信息明文存、每把 Key 用 Windows DPAPI 按用户加密，可一键清除 |
 | 8 | 命令行/自动化 | `--list-only` / `--model` / `--json`，退出码 0/2 可接 CI 或计划任务 |
-| 9 | 自检 | 本地 mock 服务器，核心 204 项 + 界面流程 157 项断言，不碰你的真实配置、`~/.claude`、`~/.codex`、`~/.grok` |
+| 9 | 自检 | 本地 mock 服务器，核心 221 项 + 界面流程 157 项断言，不碰你的真实配置、`~/.claude`、`~/.codex`、`~/.grok` |
 | 10 | **Claude Code 一键接入** | 检测 /v1/messages 通道 → 映射模型别名 → 写 settings.json / 生成启动脚本 → 端到端跑通 `claude -p PONG` |
 | 11 | **Codex 一键接入（CLI + 桌面版）** | 检测 `/v1/responses` 与 `/v1/chat/completions` 决定 `wire_api` → 选 GPT 模型 → 合并 `~/.codex/config.toml` + 写**用户级环境变量**（桌面版靠它取 Key）→ 端到端跑通 `codex exec PONG` |
 | 12 | **每把 Key 各归其位** | Claude Code 页默认挑 Anthropic 格式的 Key，Codex 页默认挑 OpenAI 格式的，Grok 页默认用站点当前选中的；都可以手动改 |
 | 13 | **Grok Build 一键接入** | 测三条通道（Chat / Responses / Messages）自动挑 `api_backend` → 写 `~/.grok/config.toml` 的 `[model.api_probe]` → 端到端跑通 `grok -p PONG` |
+| 14 | **网络出口可控** | 顶部「出口」可切**跟随系统代理 / 直连 / 自定义代理**；一条不通自动换另一条，不会因为 Clash 节点挂了就判成「Key 无效」 |
 
 ---
 
@@ -128,7 +129,7 @@ API Key  [ OpenAI 主 Key ▾ ] [ sk-•••••••• ] [ ]显示 [＋�
 | 方式 | 操作 |
 | --- | --- |
 | 图形界面 | 双击 **`启动.bat`**（或用 `python api_probe.py`） |
-| 自检 | 双击 **`自检.bat`**（本地 mock 服务器，204 项断言，不访问外网） |
+| 自检 | 双击 **`自检.bat`**（本地 mock 服务器，221 项断言，不访问外网） |
 | 打包 exe | 双击 **`打包exe.bat`** → 产物在 `dist\ApiProbe.exe` |
 | 命令行 | `python api_probe.py --url https://xxx.com/v1 --key sk-xxx --list-only` |
 
@@ -153,9 +154,20 @@ API Key  [ OpenAI 主 Key ▾ ] [ sk-•••••••• ] [ ]显示 [＋�
 ## 4. 界面说明
 
 ### 顶部输入区
-站点下拉 + `＋ 添加站点 / 编辑 / 删除`、API 地址、API Key（可点「显示」）、指定模型、超时，
+站点下拉 + `＋ 添加站点 / 编辑 / 删除`、API 地址、API Key（可点「显示」）、指定模型、超时、**出口**，
 以及三个开关：校验 TLS 证书、深度检测、**记住 Key**；右侧显示配置文件位置，
-旁边有「清除已存 Key」按钮。这些状态下次启动会自动恢复（含上次选中的站点）。
+旁边有「清除已存 Key」按钮。这些状态下次启动会自动恢复（含上次选中的站点与出口设置）。
+
+**出口**（默认「跟随系统代理」）决定请求从哪条路出去：
+
+| 选项 | 行为 |
+| --- | --- |
+| 跟随系统代理 | 用 Windows「Internet 选项」里的代理（Clash / V2Ray 等一般写在这里） |
+| 直连 | 完全不走代理，也不读环境变量 |
+| 自定义代理 | 用你在右边填的地址，如 `127.0.0.1:7897`（不写 `http://` 会自动补） |
+
+不管选哪个，**一条出口连不上时会自动换另一条再试一次**（代理→直连，直连→系统代理），
+并在结论里留一句「已自动改用直连」。命中的站会记住这条结论，后续请求不再白等。
 
 地址写法很随意，会自动归一化：
 `https://x.com/v1/chat/completions`、`https://x.com/v1`、`x.com` → 都按 `https://x.com` 处理，再拼回正确的 `/v1/models`。
@@ -454,7 +466,9 @@ python api_probe.py --url ... --codex-check     # 检测 OpenAI 通道，判断 
 python api_probe.py --url ... --grok-check      # 为 Grok Build 选 api_backend，并打印配置片段
 python api_probe.py --url ... --no-verify       # 跳过 TLS 证书校验（自签证书站点）
 python api_probe.py --url ... --no-deep         # 关闭深度检测，少发一次请求
-python api_probe.py --selftest                  # 核心逻辑自检（204 项）
+python api_probe.py --url ... --direct          # 强制直连（系统代理挂了时用这个）
+python api_probe.py --url ... --proxy 127.0.0.1:7897   # 走指定代理
+python api_probe.py --selftest                  # 核心逻辑自检（221 项）
 python api_probe.py --uitest                    # 界面 + 站点管理 + 两段式 + 三个接入页（157 项）
 ```
 
@@ -470,7 +484,7 @@ python api_probe.py --uitest                    # 界面 + 站点管理 + 两段
 | --- | --- | --- |
 | 站点列表：名称、地址、默认模型、各把 Key 的名称与格式标签、当前选中哪把 | 总是保存 | 明文（不是敏感信息） |
 | 「自定义（临时）」那一格的地址与模型 | 总是保存 | 明文 |
-| 上次选中的站点、超时、并发数、TLS 校验、深度检测、只看主流、窗口大小 | 总是保存 | 明文 |
+| 上次选中的站点、超时、并发数、TLS 校验、深度检测、只看主流、**出口设置**、窗口大小 | 总是保存 | 明文 |
 | **各站点的每一把 API Key**（含名称与格式标签） | 仅勾选「记住 Key」时 | **加密**（Windows DPAPI，按当前用户），Key 名称与格式明文 |
 | **批量测试列表**（含里面各站的 Key） | 仅勾选「记住 Key」时 | **加密**（同上） |
 
@@ -504,6 +518,18 @@ python api_probe.py --uitest                    # 界面 + 站点管理 + 两段
 
 **Q：站点能连上，但列表为空 / 404？**
 部分中转站关了 `/v1/models`。这时直接在上方「指定模型」里手写一个模型名，点第 ② 步即可测。
+
+**Q：同一把 Key，Codex / Claude Code 里用得好好的，这个工具却取不到模型？**
+九成是**出口**问题，不是 Key 问题。工具走的是 Python `urllib`，它会读 Windows「Internet 选项」里的代理；
+而 Codex / Claude Code 这类客户端默认直连。所以系统代理（Clash、V2Ray…）进程在、节点却挂了时，
+就会出现「agent 正常、工具全超时」。
+
+判断依据：结论里写的是一串 `超时（>20s）` / `The handshake operation timed out`，而不是 401/403。
+
+处置：把顶部「出口」切成 **直连**（或填一个确实能用的代理端口）再点第 ① 步。
+v1.9.1 起即使不切也会自动换路重试一次，只是先切好可以省掉一次等待。
+另外也留意域名差异：同一家中转站常常有好几个入口（例如 `api.xxx.com` 与 `cn2.xxx.com`），
+agent 里写的是哪个，工具里就填哪个。
 
 **Q：报 SSL 证书错误？**
 自建站常用自签证书，取消勾选「校验 TLS 证书」即可（**仅对你信任的地址这么做**）。
@@ -579,7 +605,7 @@ python api_probe.py --url https://your-relay.com/v1 --key sk-xxx --list-only --j
 | --- | --- |
 | `api_probe.py` | 全部功能（核心探测 + 站点管理 + Claude Code / Codex 接入 + 图形界面 + 自检），单文件 |
 | `启动.bat` | 双击启动图形界面（纯 ASCII，勿加中文） |
-| `自检.bat` | 跑 204 项核心逻辑自检（纯 ASCII）；界面/流程自检用 `python api_probe.py --uitest`（157 项） |
+| `自检.bat` | 跑 221 项核心逻辑自检（纯 ASCII）；界面/流程自检用 `python api_probe.py --uitest`（157 项） |
 | `打包exe.bat` | 用 PyInstaller 打成单文件 exe（纯 ASCII） |
 | `README.md` | 本文档 |
 | `LICENSE` | MIT 许可证 |
@@ -595,7 +621,10 @@ python api_probe.py --url https://your-relay.com/v1 --key sk-xxx --list-only --j
 | `~/.grok/config.toml` | Grok Build 配置（本工具只加 `[model.api_probe]` 与 `[models].default`，改前自动备份） |
 | `~/.api_probe/claude-code-<站点>/`、`codex-<站点>/`、`grok-<站点>/` | 生成的启动脚本与隔离配置目录 |
 
-版本 v1.9.0（新增 Grok Build 一键接入：三通道选 api_backend、合并 ~/.grok/config.toml、端到端验证）
+版本 v1.9.1（新增「出口」设置：跟随系统代理 / 直连 / 自定义代理，代理不通时自动换直连；
+连不上时不再误判成 Key 无效）
+
+上一版 v1.9.0（Grok Build 一键接入：三通道选 api_backend、合并 ~/.grok/config.toml、端到端验证）
 
 ---
 

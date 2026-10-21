@@ -112,7 +112,7 @@ import zlib
 from pathlib import Path
 
 APP_NAME = "API 中转站测活工具"
-APP_VERSION = "1.9.0"
+APP_VERSION = "1.9.1"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) api-probe/1.0"
 DEFAULT_TIMEOUT = 20.0
 CONFIG_PATH = Path.home() / ".api_probe.json"
@@ -292,6 +292,122 @@ def ssl_context(verify: bool) -> ssl.SSLContext:
     return ctx
 
 
+# ---------------------------------------------------------------------
+# 网络出口：跟随系统代理 / 直连 / 自定义代理
+#
+# 为什么要有这一层：urllib 默认会读 Windows「Internet 选项」里的代理（Clash、
+# V2Ray 之类都写在那里）。代理进程在、节点却挂了的时候，请求会卡在 CONNECT /
+# TLS 握手一直等到超时，表现就是「这个站取不到模型」；而 Codex / Claude Code
+# 这类不读系统代理的客户端反而直连正常。所以这里做两件事：
+#   ① 允许手动指定出口（跟随系统 / 直连 / 自定义代理）；
+#   ② 一条出口不通就自动换另一条，并把这个决定记下来，后续同类请求直接走通的。
+# ---------------------------------------------------------------------
+NET = {"proxy_mode": "auto", "proxy_url": ""}     # auto | direct | custom
+PROXY_MODE_LABELS = {"auto": "跟随系统代理", "direct": "直连", "custom": "自定义代理"}
+_TRANSPORT_PREF: dict[str, str] = {}               # host -> 实测能用的出口
+NET_FALLBACKS: dict[str, str] = {}                 # host -> 换出口的说明
+
+
+class TransportError(Exception):
+    """网络层失败（连不上 / 握手超时），区别于 HTTP 状态码错误。"""
+
+    def __init__(self, message: str, via: str = "", timed_out: bool = False):
+        super().__init__(message)
+        self.message = message
+        self.via = via
+        self.timed_out = timed_out
+
+
+def normalize_proxy_url(url: str) -> str:
+    """把 127.0.0.1:7897 这种写法补成 http://127.0.0.1:7897。"""
+    u = (url or "").strip()
+    if not u:
+        return ""
+    if "://" not in u:
+        u = "http://" + u
+    return u
+
+
+def proxy_map(mode: str = "", url: str = "") -> dict | None:
+    """把出口设置翻译成 ProxyHandler 的参数。
+
+    None  → 交给 urllib 默认行为（读系统代理 / 环境变量）
+    {}    → 直连，不走任何代理
+    {...} → 走指定代理
+    """
+    mode = mode or NET.get("proxy_mode") or "auto"
+    if mode == "direct":
+        return {}
+    if mode == "custom":
+        u = normalize_proxy_url(url or NET.get("proxy_url") or "")
+        return {"http": u, "https": u} if u else {}
+    return None
+
+
+def build_opener(verify: bool, proxy=None):
+    handler = urllib.request.ProxyHandler(proxy) if proxy is not None \
+        else urllib.request.ProxyHandler()
+    return urllib.request.build_opener(handler,
+                                       urllib.request.HTTPSHandler(context=ssl_context(verify)))
+
+
+def _transport_chain(host: str) -> list[tuple[str, dict | None]]:
+    """按当前设置给出尝试顺序：首选出口 → 兜底出口。"""
+    mode = NET.get("proxy_mode") or "auto"
+    if mode == "direct":
+        return [("direct", {})]
+    if mode == "custom":
+        pm = proxy_map("custom")
+        chain = [("custom", pm), ("direct", {})] if pm else [("direct", {})]
+        if len(chain) == 2 and _TRANSPORT_PREF.get(host) == "direct":
+            chain.reverse()                  # 这个站已经证明代理走不通，别再白等一次
+        return chain
+    chain = [("auto", None), ("direct", {})]
+    if _TRANSPORT_PREF.get(host) == "direct":
+        chain.reverse()
+    return chain
+
+
+def open_url(url: str, make_request, timeout: float, verify: bool):
+    """按出口策略打开一次请求，返回 (response, 实际用的出口)。
+
+    首选出错（连不上 / 握手超时）时换另一条路重试；HTTP 状态码错误原样抛出，
+    由调用方按 HTTPError 处理。
+    """
+    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    chain = _transport_chain(host)
+    last: TransportError | None = None
+    for i, (via, pmap) in enumerate(chain):
+        try:
+            return build_opener(verify, pmap).open(make_request(), timeout=timeout), via
+        except urllib.error.HTTPError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            reason = getattr(e, "reason", e)
+            text = reason if isinstance(reason, str) else f"{type(reason).__name__}: {reason}"
+            timed = (isinstance(e, (socket.timeout, TimeoutError))
+                     or isinstance(reason, (socket.timeout, TimeoutError))
+                     or "timed out" in text.lower())
+            last = TransportError(f"超时（>{timeout:g}s）" if timed else f"网络错误: {text}",
+                                  via=via, timed_out=timed)
+            if i + 1 < len(chain):
+                nxt = chain[i + 1][0]
+                _TRANSPORT_PREF[host] = nxt
+                NET_FALLBACKS[host] = (
+                    f"{PROXY_MODE_LABELS.get(via, via)} 连不上（{last.message}），"
+                    f"已自动改用{PROXY_MODE_LABELS.get(nxt, nxt)}")
+            continue
+    raise last or TransportError("网络错误", via=chain[0][0] if chain else "")
+
+
+def apply_net_config(mode: str = "", url: str = "") -> None:
+    """界面 / 命令行改出口设置：顺便清掉「这个 host 该走哪条路」的旧记忆。"""
+    NET["proxy_mode"] = mode if mode in PROXY_MODE_LABELS else "auto"
+    NET["proxy_url"] = normalize_proxy_url(url)
+    _TRANSPORT_PREF.clear()
+    NET_FALLBACKS.clear()
+
+
 def normalize_base(url: str) -> str:
     """把用户输入的各种写法归一化为 base（不含 /v1 等端点后缀）。"""
     u = (url or "").strip().strip('"').strip("'").strip()
@@ -381,9 +497,9 @@ def detect_panel_hint(text: str) -> str:
 # =====================================================================
 
 class HttpResult:
-    __slots__ = ("ok", "status", "reason", "headers", "text", "latency_ms", "error", "url")
+    __slots__ = ("ok", "status", "reason", "headers", "text", "latency_ms", "error", "url", "via")
 
-    def __init__(self, ok, status, reason, headers, text, latency_ms, error, url):
+    def __init__(self, ok, status, reason, headers, text, latency_ms, error, url, via=""):
         self.ok = ok
         self.status = status
         self.reason = reason
@@ -392,6 +508,7 @@ class HttpResult:
         self.latency_ms = latency_ms
         self.error = error or ""
         self.url = url
+        self.via = via
 
     @property
     def json(self):
@@ -412,10 +529,9 @@ def http_request(method: str, url: str, headers: dict | None = None, payload=Non
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         hdrs.setdefault("Content-Type", "application/json")
     req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
-    ctx = ssl_context(verify) if url.lower().startswith("https") else None
     t0 = time.perf_counter()
     try:
-        resp = urllib.request.urlopen(req, timeout=timeout, context=ctx)
+        resp, via = open_url(url, lambda: req, timeout, verify)
     except urllib.error.HTTPError as e:
         raw = b""
         try:
@@ -424,11 +540,8 @@ def http_request(method: str, url: str, headers: dict | None = None, payload=Non
             pass
         return HttpResult(False, e.code, str(e.reason), dict(e.headers or {}),
                           decode_body(raw, dict(e.headers or {})), now_ms(t0), "", url)
-    except urllib.error.URLError as e:
-        reason = getattr(e, "reason", e)
-        return HttpResult(False, 0, "", {}, "", now_ms(t0), f"网络错误: {reason}", url)
-    except (socket.timeout, TimeoutError):
-        return HttpResult(False, 0, "", {}, "", now_ms(t0), f"超时（>{timeout:g}s）", url)
+    except TransportError as e:
+        return HttpResult(False, 0, "", {}, "", now_ms(t0), e.message, url, e.via)
     except Exception as e:  # noqa: BLE001
         return HttpResult(False, 0, "", {}, "", now_ms(t0), f"{type(e).__name__}: {e}", url)
     with resp:
@@ -436,12 +549,12 @@ def http_request(method: str, url: str, headers: dict | None = None, payload=Non
             raw = resp.read(read_limit)
         except (socket.timeout, TimeoutError):
             return HttpResult(False, resp.status, "", dict(resp.headers or {}), "",
-                              now_ms(t0), "读取响应超时", url)
+                              now_ms(t0), "读取响应超时", url, via)
         except Exception as e:  # noqa: BLE001
             return HttpResult(False, resp.status, "", dict(resp.headers or {}), "",
-                              now_ms(t0), f"读取失败: {e}", url)
+                              now_ms(t0), f"读取失败: {e}", url, via)
         return HttpResult(True, resp.status, str(resp.reason), dict(resp.headers or {}),
-                          decode_body(raw, dict(resp.headers or {})), now_ms(t0), "", url)
+                          decode_body(raw, dict(resp.headers or {})), now_ms(t0), "", url, via)
 
 
 class SseCollector:
@@ -458,6 +571,7 @@ class SseCollector:
         self.chunks = 0
         self.done = False
         self.timed_out = False
+        self.via = ""
 
 
 def stream_generate(url: str, headers: dict, payload: dict, feeder, timeout: float,
@@ -471,10 +585,9 @@ def stream_generate(url: str, headers: dict, payload: dict, feeder, timeout: flo
     hdrs["Content-Type"] = "application/json"
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
-    ctx = ssl_context(verify) if url.lower().startswith("https") else None
     t0 = time.perf_counter()
     try:
-        resp = urllib.request.urlopen(req, timeout=timeout, context=ctx)
+        resp, col.via = open_url(url, lambda: req, timeout, verify)
     except urllib.error.HTTPError as e:
         raw = b""
         try:
@@ -485,12 +598,9 @@ def stream_generate(url: str, headers: dict, payload: dict, feeder, timeout: flo
         col.error = extract_error_message(decode_body(raw, dict(e.headers or {})), e.code)
         col.total_ms = now_ms(t0)
         return col
-    except urllib.error.URLError as e:
-        col.error = f"网络错误: {getattr(e, 'reason', e)}"
-        col.total_ms = now_ms(t0)
-        return col
-    except (socket.timeout, TimeoutError):
-        col.error = f"超时（>{timeout:g}s）"
+    except TransportError as e:
+        col.error = e.message
+        col.via = e.via
         col.total_ms = now_ms(t0)
         return col
     except Exception as e:  # noqa: BLE001
@@ -903,6 +1013,9 @@ def probe_site(base_input: str, key: str, timeout: float = DEFAULT_TIMEOUT,
         order = ["anthropic", "openai", "gemini"]
 
     auth_fail_msg = ""
+    transport_fails = 0
+    transport_msg = ""
+    aborted = False
     for proto in order:
         spec = PROTOCOLS[proto]
         for scheme, urlf in spec["models_probes"]:
@@ -934,21 +1047,39 @@ def probe_site(base_input: str, key: str, timeout: float = DEFAULT_TIMEOUT,
                         hint = detect_panel_hint(r.text)
                         if hint and not res["fingerprint"]:
                             res["fingerprint"] = hint
+                    if not r.status:            # 网络层就失败了：换再多的路径也是同一个 host
+                        transport_fails += 1
+                        if transport_fails >= 2:
+                            aborted = True
+                            transport_msg = attempt["error"]
                 res["attempts"].append(attempt)
-            if res["protocol"]:
+                if aborted:
+                    break
+            if res["protocol"] or aborted:
                 break
-        if res["protocol"]:
+        if res["protocol"] or aborted:
             break
 
     if not res["protocol"]:
-        # 模型端点全挂：仍按 OpenAI 兼容处理，让用户手工输入模型名再测
-        L("  /v1/models 全部不可用；仍按 OpenAI 兼容处理，可手工输入模型名再测试")
-        res["protocol"] = "openai"
-        res["protocol_label"] = "OpenAI 兼容（推测）"
-        res["models_error"] = auth_fail_msg or "所有模型列表端点均失败"
+        if aborted:
+            L(f"  连不上站点（{transport_msg}），跳过其余协议探测，免得白等")
+            res["protocol"] = "openai"
+            res["protocol_label"] = "OpenAI 兼容（推测）"
+            res["models_error"] = f"连不上站点：{transport_msg}"
+        else:
+            # 模型端点全挂：仍按 OpenAI 兼容处理，让用户手工输入模型名再测
+            L("  /v1/models 全部不可用；仍按 OpenAI 兼容处理，可手工输入模型名再测试")
+            res["protocol"] = "openai"
+            res["protocol_label"] = "OpenAI 兼容（推测）"
+            res["models_error"] = auth_fail_msg or "所有模型列表端点均失败"
 
     res["model_count"] = len(res["models"])
     L(f"  -> 协议={res['protocol_label']} 模型数={res['model_count']}")
+    for host, why in list(NET_FALLBACKS.items()):
+        if host and host in base.lower():
+            res["net_fallbacks"] = list(NET_FALLBACKS.items())
+            L(f"  出口切换：{why}（当前设置：{PROXY_MODE_LABELS.get(NET['proxy_mode'], NET['proxy_mode'])}）")
+            break
     if stop_event is not None and stop_event.is_set():
         res["verdict"] = "已手动停止"
         return res
@@ -1107,6 +1238,8 @@ def _finalize_site(res: dict) -> None:
         w.append(("warn", res.get("models_error") or "未取到模型列表（部分站点禁用了 /v1/models）"))
     if res.get("fingerprint"):
         w.append(("info", f"站点指纹：{res['fingerprint']}"))
+    for _host, why in res.get("net_fallbacks") or []:
+        w.append(("info", why))
     if models:
         fams = []
         for fam, keys in (("OpenAI", ("gpt", "o1", "o3", "o4")),
@@ -1123,12 +1256,27 @@ def _finalize_site(res: dict) -> None:
     if auth_err:
         w.append(("error", f"接口鉴权报错：{auth_err}"))
 
+    # 全部尝试都停在网络层（状态码 0）→ 是连不上，不是 Key 不行
+    net_only = (not models and res.get("attempts")
+                and all(not a.get("status") for a in res["attempts"]))
+    net_err = ""
+    if net_only:
+        net_err = (res["attempts"][0].get("error") or "连接失败")
+        mode = NET.get("proxy_mode") or "auto"
+        w.append(("error", f"所有端点都在网络层失败：{net_err}；"
+                           f"当前出口 = {PROXY_MODE_LABELS.get(mode, mode)}，"
+                           "多半是系统代理不通（换「直连」再试）"))
+
     if res["ok_site"]:
         res["verdict"] = (f"第 1 步完成：{res.get('protocol_label')}，共 {len(models)} 个模型"
                           "　→ 请在「模型列表」中挑一个模型，再做第 2 步生成测试")
         res["verdict_level"] = "ok"
     elif auth_err:
         res["verdict"] = f"第 1 步失败：{auth_err}"
+        res["verdict_level"] = "error"
+    elif net_err:
+        res["verdict"] = (f"连不上站点：{net_err}　→ 换「出口」为直连再试；"
+                          "线路抖动时再点一次第 ① 步通常就过了")
         res["verdict_level"] = "error"
     elif res.get("protocol"):
         res["verdict"] = "第 1 步完成，但未取到模型列表：可手工输入模型名后做第 2 步"
@@ -2937,9 +3085,25 @@ class ProbeApp:
 
         row3 = ttk.Frame(top)
         row3.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Label(row3, text="出口").pack(side="left", padx=(0, 4))
+        self.var_proxy_mode = tk.StringVar(value=PROXY_MODE_LABELS["auto"])
+        self.cmb_proxy = ttk.Combobox(row3, textvariable=self.var_proxy_mode, width=13,
+                                      state="readonly",
+                                      values=[PROXY_MODE_LABELS[m] for m in ("auto", "direct",
+                                                                             "custom")])
+        self.cmb_proxy.pack(side="left")
+        self.cmb_proxy.bind("<<ComboboxSelected>>", lambda e: self._on_proxy_change())
+        self.var_proxy_url = tk.StringVar()
+        self.ent_proxy = ttk.Entry(row3, textvariable=self.var_proxy_url, width=20,
+                                   font=self.mono_font)
+        self.ent_proxy.pack(side="left", padx=(4, 0))
+        self.ent_proxy.bind("<FocusOut>", lambda e: self._on_proxy_change())
+        self.ent_proxy.bind("<Return>", lambda e: self._on_proxy_change())
+        ttk.Label(row3, text="（系统代理挂了就切直连）",
+                  style="Hint.TLabel").pack(side="left", padx=(4, 0))
         self.var_verify = tk.BooleanVar(value=True)
         ttk.Checkbutton(row3, text="校验 TLS 证书（自签站可取消）",
-                        variable=self.var_verify).pack(side="left")
+                        variable=self.var_verify).pack(side="left", padx=(12, 0))
         self.var_deep = tk.BooleanVar(value=True)
         ttk.Checkbutton(row3, text="深度检测（补测 usage）",
                         variable=self.var_deep).pack(side="left", padx=(12, 0))
@@ -2996,7 +3160,7 @@ class ProbeApp:
         self.lbl_summary.pack(side="left")
 
     def _build_tab_overview(self):
-        tk, ttk = self.tk, self.ttk
+        ttk = self.ttk
         frame = ttk.Frame(self.nb)
         self.nb.add(frame, text="  概览  ")
 
@@ -4373,7 +4537,6 @@ class ProbeApp:
         except Exception:
             pass
         inline = bool(self.grok_write_inline.get())
-        key = "" if inline else ""
         merged = merge_grok_config(
             existing, GROK_MODEL_KEY, model, base_url, backend,
             self.var_site.get() or "API Probe",
@@ -5019,11 +5182,16 @@ class ProbeApp:
             self.var_deep.set(bool(cfg.get("deep_check", True)))
             self.var_only_main.set(bool(cfg.get("only_mainstream", False)))
             self.var_workers.set(str(cfg.get("workers", 2)))
+            mode = str(cfg.get("proxy_mode") or "auto")
+            if mode in PROXY_MODE_LABELS:
+                self.var_proxy_mode.set(PROXY_MODE_LABELS[mode])
+            self.var_proxy_url.set(str(cfg.get("proxy_url") or ""))
             geo = str(cfg.get("geometry") or "")
             if re.fullmatch(r"\d+x\d+([+-]\d+[+-]\d+)?", geo):
                 self.root.geometry(geo)
         except Exception:
             pass
+        self._apply_net()
         remember = bool(cfg.get("remember_key", False))
         self.var_remember.set(remember)
 
@@ -5152,6 +5320,8 @@ class ProbeApp:
                 "adhoc": adhoc_out,
                 "timeout": self._timeout(),
                 "verify_tls": bool(self.var_verify.get()),
+                "proxy_mode": self._proxy_mode(),
+                "proxy_url": self.var_proxy_url.get().strip(),
                 "deep_check": bool(self.var_deep.get()),
                 "only_mainstream": bool(self.var_only_main.get()),
                 "workers": self._workers(),
@@ -5230,6 +5400,36 @@ class ProbeApp:
             return max(1, min(8, int(self.var_workers.get())))
         except Exception:
             return 2
+
+    # ---------------- 网络出口 ----------------
+    def _proxy_mode(self) -> str:
+        label = (self.var_proxy_mode.get() if hasattr(self, "var_proxy_mode") else "") or ""
+        for mode, text in PROXY_MODE_LABELS.items():
+            if label == text:
+                return mode
+        return "auto"
+
+    def _apply_net(self) -> None:
+        """把界面上的出口设置应用到所有请求。"""
+        try:
+            apply_net_config(self._proxy_mode(), self.var_proxy_url.get())
+        except Exception:
+            pass
+        try:
+            custom = self._proxy_mode() == "custom"
+            self.ent_proxy.configure(state="normal" if custom else "disabled")
+        except Exception:
+            pass
+
+    def _on_proxy_change(self):
+        self._apply_net()
+        mode = self._proxy_mode()
+        if mode == "custom" and not normalize_proxy_url(self.var_proxy_url.get()):
+            self._set_status("自定义代理需要填地址，例如 127.0.0.1:7897")
+        else:
+            self._set_status(f"出口已切换：{PROXY_MODE_LABELS[mode]}"
+                             + ("（≠ 系统代理，下次请求用这个）" if mode != "auto" else ""))
+        self._schedule_save(200)
 
     # ---------------- 第 1 步：拉取模型列表 ----------------
     def fetch_models(self):
@@ -6528,6 +6728,108 @@ def selftest() -> int:
         except Exception as e:  # noqa: BLE001
             check(f"（无法做 AST 审计：{e}）", False)
 
+    print("\n[16] 网络出口：代理 / 直连（回归：系统代理挂了不能拖死整条链路）")
+    check("直连的 proxy_map 是空 dict", proxy_map("direct") == {})
+    check("跟随系统代理的 proxy_map 是 None（交给 urllib 读系统设置）",
+          proxy_map("auto") is None)
+    pm = proxy_map("custom", "127.0.0.1:7897")
+    check("自定义代理会自动补 http:// 并同时用于 http/https",
+          pm == {"http": "http://127.0.0.1:7897", "https": "http://127.0.0.1:7897"}, f"-> {pm}")
+    check("自定义代理留空时退回直连", proxy_map("custom", "") == {})
+    apply_net_config("auto")
+    check("auto 模式的尝试顺序：系统代理 → 直连",
+          _transport_chain("example.com") == [("auto", None), ("direct", {})])
+    _TRANSPORT_PREF["example.com"] = "direct"
+    check("记住某 host 直连可用后，后续请求先直连",
+          _transport_chain("example.com")[0][0] == "direct")
+    _TRANSPORT_PREF.clear()
+    apply_net_config("direct")
+    check("direct 模式只有一条路", _transport_chain("example.com") == [("direct", {})])
+    apply_net_config("auto")
+
+    # 用假 opener 验证「第一条出口挂了 → 自动换直连」，不依赖外网
+    class _FakeResp:
+        status, reason, headers = 200, "OK", {}
+
+        def read(self, n=-1):
+            return b'{"data":[]}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    real_build = build_opener
+    seen: list = []
+
+    def fake_build(verify, proxy=None):
+        seen.append(proxy)
+
+        class _Opener:
+            def open(self, req, timeout=None):
+                if proxy:                      # 模拟代理端口不通
+                    raise urllib.error.URLError(socket.timeout("timed out"))
+                return _FakeResp()
+
+        return _Opener()
+
+    globals()["build_opener"] = fake_build
+    try:
+        NET_FALLBACKS.clear()
+        _TRANSPORT_PREF.clear()
+        apply_net_config("custom", "127.0.0.1:9")
+        r = http_request("GET", "https://relay.example.com/v1/models", timeout=5)
+        check("首选出口失败后自动用直连重试并成功", r.ok and r.status == 200,
+              f"-> {r.status} {r.error}")
+        check("结果里记录了实际出口是 direct", r.via == "direct", f"-> {r.via}")
+        check("两条出口都被试过（代理 → 直连）", len(seen) == 2, f"-> {seen}")
+        check("切换原因被记下来，可以提示用户", bool(NET_FALLBACKS), f"-> {NET_FALLBACKS}")
+        check("后续同类请求直接走直连（不再白等一次）",
+              _transport_chain("relay.example.com")[0][0] == "direct")
+    finally:
+        globals()["build_opener"] = real_build
+        apply_net_config("auto")
+        _TRANSPORT_PREF.clear()
+        NET_FALLBACKS.clear()
+
+    srv, base = _mock_server("openai")
+    try:
+        apply_net_config("custom", "127.0.0.1:9")
+        site = probe_site(base, "sk-mock", timeout=8)
+        check("自定义代理连不上时，第 1 步照样拿到 5 个模型", site["model_count"] == 5,
+              f"-> {site['model_count']} {site['verdict']}")
+        check("第 1 步不会把网络问题误判成 Key 问题", "Key" not in site["verdict"],
+              f"-> {site['verdict']}")
+    finally:
+        srv.shutdown()
+        apply_net_config("auto")
+        _TRANSPORT_PREF.clear()
+        NET_FALLBACKS.clear()
+
+    # 整个站都连不上时，不该把 7 条路径逐条等满超时（用户会以为卡死）
+    def dead_build(verify, proxy=None):
+        class _DeadOpener:
+            def open(self, req, timeout=None):
+                raise urllib.error.URLError(socket.timeout("timed out"))
+
+        return _DeadOpener()
+
+    globals()["build_opener"] = dead_build
+    try:
+        apply_net_config("direct")
+        dead = probe_site("https://unreachable.example.com", "sk-x", timeout=3)
+        check("连不上时只探 2 条路径就收手", len(dead["attempts"]) <= 2,
+              f"-> {len(dead['attempts'])} 次")
+        check("结论写的是连不上，而不是 Key 无效",
+              dead["verdict"].startswith("连不上站点"), f"-> {dead['verdict']}")
+        check("结论里给出下一步（换出口）", "出口" in dead["verdict"], f"-> {dead['verdict']}")
+    finally:
+        globals()["build_opener"] = real_build
+        apply_net_config("auto")
+        _TRANSPORT_PREF.clear()
+        NET_FALLBACKS.clear()
+
     print(f"\n结果：{ok_count} 通过 / {fail_count} 失败")
     return 1 if fail_count else 0
 
@@ -7270,7 +7572,17 @@ def main(argv=None) -> int:
                     help="为 Grok Build 选协议：测三条通道并给出 api_backend 与配置片段")
     ap.add_argument("--selftest", action="store_true", help="运行内置自检")
     ap.add_argument("--uitest", action="store_true", help="运行图形界面构建自检")
+    ap.add_argument("--proxy", default="", metavar="URL",
+                    help="走指定代理（如 127.0.0.1:7897）；不给就跟随系统代理")
+    ap.add_argument("--direct", action="store_true", help="强制直连，不读系统代理")
     args = ap.parse_args(argv)
+
+    if args.direct:
+        apply_net_config("direct")
+    elif args.proxy:
+        apply_net_config("custom", args.proxy)
+    else:
+        apply_net_config("auto")
 
     if args.selftest:
         return selftest()
