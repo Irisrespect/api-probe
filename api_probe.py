@@ -221,6 +221,55 @@ def mask_key(key: str) -> str:
     return f"{key[:6]}...{key[-4:]} (len={len(key)})"
 
 
+# --------------------------- 安全写盘 / 安全读盘 ---------------------------
+# 这几个落盘目标都属「写坏一半就完蛋」：config.toml 半截 → Codex 读不出配置
+# （桌面版直接弹「无法加载组织设置」）；.env 半截 → Key 变成半条；
+# 启动脚本半截 → cmd 报语法错。所以统一走「临时文件 + 原子替换」。
+
+def _atomic_write_text(p: str | Path, text: str, encoding: str = "utf-8",
+                       newline: str | None = None) -> None:
+    """原子写文本：先写同目录临时文件，fsync 后再 os.replace 覆盖目标。"""
+    target = Path(p)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=f".{target.name}.tmp-")
+    try:
+        with os.fdopen(fd, "w", encoding=encoding, newline=newline) as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, target)          # 同盘 rename，原子生效
+    except BaseException:
+        try:
+            os.unlink(tmp)               # 失败不留残渣
+        except OSError:
+            pass
+        raise
+
+
+def _read_text_sig(p: str | Path) -> str:
+    """读文本并吃掉 UTF-8 BOM。
+
+    Windows 编辑器常给文件加 BOM；带 BOM 的 config.toml 会被 TOML 解析器
+    判成非法文档，于是工具报「现有配置不是合法 TOML」并把用户挡在门外——
+    实际文件是好的，只是开头多了 3 个字节。
+    """
+    return Path(p).read_text(encoding="utf-8-sig")
+
+
+def _backup_path(p: str | Path) -> Path:
+    """备份路径：时间戳只到秒，同秒两次会互相覆盖，这里补序号避免丢上一份。"""
+    target = Path(p)
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    cand = target.with_name(f"{target.name}.bak-apiprobe-{ts}")
+    if not cand.exists():
+        return cand
+    for i in range(2, 1000):
+        cand = target.with_name(f"{target.name}.bak-apiprobe-{ts}-{i}")
+        if not cand.exists():
+            return cand
+    return target.with_name(f"{target.name}.bak-apiprobe-{ts}-{os.getpid()}")
+
+
 # --------------------------- 本机凭据加密（Windows DPAPI） ---------------------------
 # 用当前 Windows 用户的凭据加解密，密钥由系统托管：同一台机器的同一个用户才能解开。
 # 非 Windows 或调用失败时返回 None，调用方回退为明文并在配置里标记「未加密」。
@@ -1890,8 +1939,7 @@ def install_claude_settings(env: dict, path: str | Path | None = None,
             out["error"] = f"现有配置无法解析（{e}），已中止以免覆盖：{p}"
             return out
         if backup:
-            ts = time.strftime("%Y%m%d-%H%M%S")
-            bak = p.with_name(p.name + f".bak-apiprobe-{ts}")
+            bak = _backup_path(p)
             try:
                 shutil.copy2(p, bak)
                 out["backup"] = str(bak)
@@ -1900,8 +1948,8 @@ def install_claude_settings(env: dict, path: str | Path | None = None,
                 return out
     merged = merge_claude_settings(existing, env)
     try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(merged, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        _atomic_write_text(p, json.dumps(merged, ensure_ascii=False, indent=2) + "\n",
+                           encoding="utf-8")
     except Exception as e:  # noqa: BLE001
         out["error"] = f"写入失败：{e}"
         return out
@@ -1950,7 +1998,8 @@ def write_claude_launcher(env: dict, path: str | Path, config_dir: str = "") -> 
     try:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(render_launcher_bat(env, config_dir), encoding="ascii", newline="")
+        _atomic_write_text(p, render_launcher_bat(env, config_dir),
+                           encoding="ascii", newline="")
     except Exception as e:  # noqa: BLE001
         out["error"] = f"写入失败：{e}"
         return out
@@ -1971,8 +2020,9 @@ def write_isolated_claude_config(env: dict, config_dir: str | Path) -> dict:
                 existing = json.loads(p.read_text(encoding="utf-8")) or {}
             except Exception:
                 existing = {}
-        p.write_text(json.dumps(merge_claude_settings(existing, env),
-                                ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        _atomic_write_text(p, json.dumps(merge_claude_settings(existing, env),
+                                         ensure_ascii=False, indent=2) + "\n",
+                           encoding="utf-8")
         out.update(ok=True, path=str(p))
     except Exception as e:  # noqa: BLE001
         out["error"] = f"生成失败：{e}"
@@ -2354,7 +2404,7 @@ def install_codex_config(model: str, base_url: str, env_key: str,
     existing = ""
     if p.exists():
         try:
-            existing = p.read_text(encoding="utf-8")
+            existing = _read_text_sig(p)
         except Exception as e:  # noqa: BLE001
             out["error"] = f"读取失败，已中止：{e}"
             return out
@@ -2377,8 +2427,7 @@ def install_codex_config(model: str, base_url: str, env_key: str,
             m2 = re.match(r'^\s*model_provider\s*=\s*"?([^"\n]*)"?\s*$', line)
             if m2 and not out["old_provider"]:
                 out["old_provider"] = m2.group(1).strip()
-        ts = time.strftime("%Y%m%d-%H%M%S")
-        bak = p.with_name(p.name + f".bak-apiprobe-{ts}")
+        bak = _backup_path(p)
         try:
             shutil.copy2(p, bak)
             out["backup"] = str(bak)
@@ -2404,8 +2453,7 @@ def install_codex_config(model: str, base_url: str, env_key: str,
             out["error"] = f"合并结果的 model_provider 不是 {CODEX_PROVIDER_ID}，已中止：{p}"
             return out
     try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(merged, encoding="utf-8")
+        _atomic_write_text(p, merged, encoding="utf-8")
     except Exception as e:  # noqa: BLE001
         out["error"] = f"写入失败：{e}"
         return out
@@ -2440,13 +2488,12 @@ def install_codex_env_key(env_key: str, value: str, path: str | Path | None = No
     lines: list[str] = []
     if p.exists():
         try:
-            lines = p.read_text(encoding="utf-8").splitlines()
+            lines = _read_text_sig(p).splitlines()
         except Exception as e:  # noqa: BLE001
             out["error"] = f"读取失败：{e}"
             return out
         try:
-            ts = time.strftime("%Y%m%d-%H%M%S")
-            bak = p.with_name(p.name + f".bak-apiprobe-{ts}")
+            bak = _backup_path(p)
             shutil.copy2(p, bak)
             out["backup"] = str(bak)
         except Exception:
@@ -2456,8 +2503,7 @@ def install_codex_env_key(env_key: str, value: str, path: str | Path | None = No
     kept.append(f"{env_key}={encoded}")
     out["quoted"] = quoted
     try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text("\n".join(kept).strip("\n") + "\n", encoding="utf-8")
+        _atomic_write_text(p, "\n".join(kept).strip("\n") + "\n", encoding="utf-8")
     except Exception as e:  # noqa: BLE001
         out["error"] = f"写入失败：{e}"
         return out
@@ -2612,10 +2658,10 @@ def verify_codex_cli(model: str, base_url: str, env_key: str, key: str,
     work = Path(tempfile.mkdtemp(prefix="api_probe_codexwork_"))
     res["config_home"] = str(home)
     try:
-        (home / "config.toml").write_text(
-            merge_codex_config("", model, base_url, env_key, "API Probe", wire_api),
-            encoding="utf-8")
-        (home / ".env").write_text(f"{env_key}={key}\n", encoding="utf-8")
+        _atomic_write_text(home / "config.toml",
+                           merge_codex_config("", model, base_url, env_key, "API Probe", wire_api),
+                           encoding="utf-8")
+        _atomic_write_text(home / ".env", f"{env_key}={key}\n", encoding="utf-8")
         last = work / "last.txt"
         args = [cli, "exec", CODEX_PING_PROMPT, "-C", str(work), "--skip-git-repo-check",
                 "--ephemeral", "-s", "read-only", "-o", str(last)]
@@ -2679,9 +2725,8 @@ def write_codex_launcher(env_key: str, key: str, path: str | Path,
             return out
     try:
         p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(render_codex_launcher(env_key, key, codex_exe, codex_home),
-                     encoding="ascii", newline="")
+        _atomic_write_text(p, render_codex_launcher(env_key, key, codex_exe, codex_home),
+                           encoding="ascii", newline="")
     except Exception as e:  # noqa: BLE001
         out["error"] = f"写入失败：{e}"
         return out
@@ -2875,7 +2920,7 @@ def install_grok_config(catalog_key: str, model: str, base_url: str,
     existing = ""
     if p.exists():
         try:
-            existing = p.read_text(encoding="utf-8")
+            existing = _read_text_sig(p)
         except Exception as e:  # noqa: BLE001
             out["error"] = f"读取失败，已中止：{e}"
             return out
@@ -2890,8 +2935,7 @@ def install_grok_config(catalog_key: str, model: str, base_url: str,
         except Exception as e:  # noqa: BLE001
             out["error"] = f"现有 config.toml 不是合法 TOML（{e}），已中止以免覆盖：{p}"
             return out
-        ts = time.strftime("%Y%m%d-%H%M%S")
-        bak = p.with_name(p.name + f".bak-apiprobe-{ts}")
+        bak = _backup_path(p)
         try:
             shutil.copy2(p, bak)
             out["backup"] = str(bak)
@@ -2902,8 +2946,7 @@ def install_grok_config(catalog_key: str, model: str, base_url: str,
                                display_name, env_key, api_key, context_window,
                                extra_headers, set_default)
     try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(merged, encoding="utf-8")
+        _atomic_write_text(p, merged, encoding="utf-8")
     except Exception as e:  # noqa: BLE001
         out["error"] = f"写入失败：{e}"
         return out
@@ -2939,8 +2982,7 @@ def write_grok_launcher(env_key: str, key: str, path: str | Path,
     lines.append(f'"{grok_exe}" %*' if grok_exe else "grok %*")
     try:
         p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text("\r\n".join(lines) + "\r\n", encoding="ascii", newline="")
+        _atomic_write_text(p, "\r\n".join(lines) + "\r\n", encoding="ascii", newline="")
     except Exception as e:  # noqa: BLE001
         out["error"] = f"写入失败：{e}"
         return out
@@ -5512,8 +5554,8 @@ class ProbeApp:
                     cfg["geometry"] = self.root.geometry()
             except Exception:
                 pass
-            CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2),
-                                   encoding="utf-8")
+            _atomic_write_text(CONFIG_PATH, json.dumps(cfg, ensure_ascii=False, indent=2),
+                               encoding="utf-8")
         except Exception:
             pass
 
@@ -6726,6 +6768,54 @@ def selftest() -> int:
         check("坏 TOML 拒绝覆盖", bad["ok"] is False and "合法 TOML" in bad["error"],
               f"-> {bad['error']}")
         check("坏文件内容原样保留", cp.read_text(encoding="utf-8") == "这不是合法 toml [[[")
+
+        # 备份唯一性：时间戳只到秒，同秒两次安装不能共用同一个备份文件名
+        with tempfile.TemporaryDirectory() as td2:
+            c2 = Path(td2) / "config.toml"
+            c2.write_text('model = "old"\n', encoding="utf-8")
+            b1 = install_codex_config("m1", "https://gw/v1", "K", "n", "responses",
+                                      path=c2)["backup"]
+            b2 = install_codex_config("m2", "https://gw/v1", "K", "n", "responses",
+                                      path=c2)["backup"]
+            check("同秒两次安装产生两个不同备份，且都还在",
+                  b1 != b2 and Path(b1).exists() and Path(b2).exists(),
+                  f"-> {Path(b1).name} / {Path(b2).name}")
+
+        # BOM：带 UTF-8 BOM 的配置不该被误判成非法 TOML
+        with tempfile.TemporaryDirectory() as td2:
+            c2 = Path(td2) / "config.toml"
+            c2.write_bytes(b'\xef\xbb\xbfmodel = "old"\n')
+            rb = install_codex_config("gpt-5", "https://gw/v1", "K", "n", "responses",
+                                      path=c2)
+            body = c2.read_bytes()
+            try:
+                import tomllib
+                okb = rb["ok"] and tomllib.loads(body.decode("utf-8"))["model"] == "gpt-5"
+            except ImportError:
+                okb = rb["ok"]
+            check("带 BOM 的 config 能正常写入，且写回后不带 BOM",
+                  okb and not body.startswith(b"\xef\xbb\xbf"), f"-> {rb['error']}")
+
+        # 原子写：替换那一步失败时，原文件必须完好，且不留临时残渣
+        with tempfile.TemporaryDirectory() as td2:
+            c2 = Path(td2) / "config.toml"
+            c2.write_text('model = "keepme"\n', encoding="utf-8")
+            orig_replace = os.replace
+
+            def _boom(*a, **k):
+                raise OSError("模拟断电/文件被占用")
+
+            os.replace = _boom
+            try:
+                res = install_codex_config("m", "https://gw/v1", "K", "n", "responses",
+                                           path=c2)
+            finally:
+                os.replace = orig_replace
+            left = [q.name for q in Path(td2).iterdir() if ".tmp-" in q.name]
+            check("写盘失败时原文件完好、不留临时文件",
+                  res["ok"] is False
+                  and c2.read_text(encoding="utf-8") == 'model = "keepme"\n'
+                  and not left, f"-> 残留 {left}")
 
         lp = Path(td) / "start-codex.bat"
         lr = write_codex_launcher("CODEX_API_KEY", "sk-x", lp, r"C:\tools\codex.exe")
