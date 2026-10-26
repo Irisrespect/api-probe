@@ -28,3 +28,6 @@ _tmp*
 *.pkg
 *.pyz
 *.toc
+
+# 本地改前备份（*.bak-dupfix-*、*.bak-apiprobe-* 等，可能含 Key，不入库）
+*.bak-*

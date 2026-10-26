@@ -2282,6 +2282,31 @@ def _strip_marker_block(text: str, begin: str, end: str) -> str:
     return "".join(out)
 
 
+def _strip_provider_table(text: str, provider_id: str) -> str:
+    """删掉任意 [model_providers.<provider_id>] 表，无论是否带标记。
+
+    旧版工具/手工写过的同名表若没有标记，_strip_marker_block 抓不到，
+    再追加一份就成了 TOML 重复键，整个 config.toml 解析失败
+    （Codex 桌面版会因此弹「无法加载组织设置」）。
+    """
+    header = re.compile(
+        r"^\s*\[\s*[\"']?model_providers[\"']?\s*\.\s*[\"']?%s[\"']?\s*\]\s*(?:#.*)?$"
+        % re.escape(provider_id)
+    )
+    out: list[str] = []
+    skipping = False
+    for line in text.splitlines(keepends=True):
+        if header.match(line):
+            skipping = True
+            continue
+        s = line.strip()
+        if skipping and s.startswith("[") and not s.startswith("[["):
+            skipping = False
+        if not skipping:
+            out.append(line)
+    return re.sub(r"\n{3,}", "\n\n", "".join(out))
+
+
 def merge_codex_config(existing: str, model: str, base_url: str, env_key: str,
                        provider_name: str = "API Probe", wire_api: str = "responses") -> str:
     """把 provider 表与顶层 model/model_provider 合并进现有 config.toml。
@@ -2292,6 +2317,7 @@ def merge_codex_config(existing: str, model: str, base_url: str, env_key: str,
     """
     text = _strip_marker_block(existing or "", CODEX_MANAGED_BEGIN, CODEX_MANAGED_END)
     text = _strip_marker_block(text, CODEX_TOP_BEGIN, CODEX_TOP_END)
+    text = _strip_provider_table(text, CODEX_PROVIDER_ID)
     kept: list[str] = []
     in_table = False
     for line in text.splitlines():
@@ -2349,6 +2375,23 @@ def install_codex_config(model: str, base_url: str, env_key: str,
             out["error"] = f"备份失败，已中止：{e}"
             return out
     merged = merge_codex_config(existing, model, base_url, env_key, provider_name, wire_api)
+    # 写盘前先自检合并结果：输入合法不代表输出合法，
+    # 一旦写出重复键，Codex 桌面版会直接弹「无法加载组织设置」并拒绝启动。
+    try:
+        import tomllib
+        parsed = tomllib.loads(merged)
+    except ImportError:
+        parsed = None
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"合并结果不是合法 TOML（{e}），已中止以免写坏配置：{p}"
+        return out
+    if parsed is not None:
+        if CODEX_PROVIDER_ID not in (parsed.get("model_providers") or {}):
+            out["error"] = f"合并结果缺少 [model_providers.{CODEX_PROVIDER_ID}]，已中止：{p}"
+            return out
+        if parsed.get("model_provider") != CODEX_PROVIDER_ID:
+            out["error"] = f"合并结果的 model_provider 不是 {CODEX_PROVIDER_ID}，已中止：{p}"
+            return out
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(merged, encoding="utf-8")
@@ -6551,6 +6594,38 @@ def selftest() -> int:
                                  "CODEX_API_KEY", "我的站点", "responses")
     check("重复执行不产生重复块",
           merged2.count(f"[model_providers.{CODEX_PROVIDER_ID}]") == 1)
+
+    # 关键回归：用户/旧版工具留下的同名 provider 表可能没有标记块，
+    # 若只按标记删除就会写出重复键，整个 config.toml 解析失败。
+    legacy_toml = ('model = "legacy-model"\nmodel_provider = "api_probe"\n\n'
+                   '[model_providers.api_probe]\nname = "legacy"\n'
+                   'base_url = "https://old.example.com/v1"\n'
+                   'env_key = "OLD_KEY"\nwire_api = "responses"\n\n'
+                   '[desktop]\ntheme = "dark"\n')
+    merged3 = merge_codex_config(legacy_toml, "gpt-5.1-codex", "https://gw.example.com/v1",
+                                 "CODEX_API_KEY", "我的站点", "responses")
+    check("无标记的同名旧 provider 表不会变成重复键",
+          merged3.count(f"[model_providers.{CODEX_PROVIDER_ID}]") == 1)
+    check("旧 provider 表的内容被彻底替换",
+          "https://old.example.com/v1" not in merged3 and "OLD_KEY" not in merged3)
+    check("替换同名表时不影响其它表", "[desktop]" in merged3)
+    merged4 = merge_codex_config('[model_providers.api_probe] # 手工加的注释\n'
+                                 'base_url = "https://old/v1"\n',
+                                 "gpt-5.1-codex", "https://gw.example.com/v1",
+                                 "CODEX_API_KEY", "我的站点", "responses")
+    check("表头带行尾注释也能被识别并替换",
+          merged4.count(f"[model_providers.{CODEX_PROVIDER_ID}]") == 1
+          and "https://old/v1" not in merged4)
+    try:
+        import tomllib
+        for label, txt in (("旧版无标记表", merged3), ("带注释表头", merged4)):
+            parsed3 = tomllib.loads(txt)
+            check(f"合并结果合法且 provider 正确（{label}）",
+                  parsed3.get("model_provider") == CODEX_PROVIDER_ID
+                  and parsed3["model_providers"][CODEX_PROVIDER_ID]["base_url"]
+                  == "https://gw.example.com/v1")
+    except ImportError:
+        check("（Python<3.11 无 tomllib，跳过 TOML 解析校验）", True)
     try:
         import tomllib
         parsed = tomllib.loads(merged2)
