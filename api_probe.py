@@ -2249,11 +2249,22 @@ def suggest_codex_model(models: list[dict], fallback: str = "") -> str:
     return choose_default_model(models) if models else ""
 
 
+def _toml_str(value: str) -> str:
+    """把任意字符串写成 TOML 基本字符串（JSON 转义是 TOML 转义的子集）。
+
+    网关返回的模型名、用户填的站点名都可能含引号/反斜杠/换行。直接 f'"{v}"'
+    轻则写出非法 TOML（整个配置失效，Codex 桌面版打不开），重则让值逃逸出去
+    注入别的键（例如 sandbox_mode）。json.dumps 产出的 \\" \\\\ \\n \\uXXXX
+    都是合法 TOML 转义，语义与原值一致。
+    """
+    return json.dumps(str(value), ensure_ascii=False)
+
+
 def render_codex_top_block(model: str) -> str:
     """顶层键（TOML 要求裸键写在任何 [table] 之前）。"""
     return (f"{CODEX_TOP_BEGIN}\n"
-            f'model = "{model}"\n'
-            f'model_provider = "{CODEX_PROVIDER_ID}"\n'
+            f"model = {_toml_str(model)}\n"
+            f"model_provider = {_toml_str(CODEX_PROVIDER_ID)}\n"
             f"{CODEX_TOP_END}\n")
 
 
@@ -2261,10 +2272,10 @@ def render_codex_provider_block(base_url: str, env_key: str, wire_api: str = "re
                                 provider_name: str = "API Probe") -> str:
     return (f"{CODEX_MANAGED_BEGIN}\n"
             f"[model_providers.{CODEX_PROVIDER_ID}]\n"
-            f'name = "{provider_name}"\n'
-            f'base_url = "{base_url}"\n'
-            f'env_key = "{env_key}"\n'
-            f'wire_api = "{wire_api}"\n'
+            f"name = {_toml_str(provider_name)}\n"
+            f"base_url = {_toml_str(base_url)}\n"
+            f"env_key = {_toml_str(env_key)}\n"
+            f"wire_api = {_toml_str(wire_api)}\n"
             f"{CODEX_MANAGED_END}\n")
 
 
@@ -2300,7 +2311,7 @@ def _strip_provider_table(text: str, provider_id: str) -> str:
             skipping = True
             continue
         s = line.strip()
-        if skipping and s.startswith("[") and not s.startswith("[["):
+        if skipping and s.startswith("["):        # 任何表头都结束表体（含 [[数组表]]）
             skipping = False
         if not skipping:
             out.append(line)
@@ -2322,7 +2333,7 @@ def merge_codex_config(existing: str, model: str, base_url: str, env_key: str,
     in_table = False
     for line in text.splitlines():
         s = line.strip()
-        if s.startswith("[") and not s.startswith("[["):
+        if s.startswith("["):                     # 含 [[数组表]]：之后都是表内键，不能当顶层删
             in_table = True
         if not in_table and re.match(r"^\s*(model|model_provider)\s*=", line):
             continue
@@ -2402,10 +2413,27 @@ def install_codex_config(model: str, base_url: str, env_key: str,
     return out
 
 
+def _dotenv_value(value: str) -> tuple[str, bool]:
+    """把值编码成 .env 里安全的形式，返回 (文本, 是否加了引号)。
+
+    .env 不是「随便写」：`#` 之后算注释、首尾空白会被裁掉，所以含这些字符的
+    值必须用双引号包起来并转义，否则写进去的值和真实 Key 不一致，用户只会
+    看到莫名其妙的 401。
+    """
+    v = str(value)
+    risky = ("#" in v or "\n" in v or "\r" in v or '"' in v or "\\" in v
+             or v != v.strip() or v[:1] in ("'", '"'))
+    if not risky:
+        return v, False
+    escaped = (v.replace("\\", "\\\\").replace('"', '\\"')
+                .replace("\n", "\\n").replace("\r", "\\r"))
+    return f'"{escaped}"', True
+
+
 def install_codex_env_key(env_key: str, value: str, path: str | Path | None = None) -> dict:
     """把 Key 写进 ~/.codex/.env —— Codex 会加载它，config 里的 env_key 就从这里取值。"""
     p = Path(path) if path else CODEX_ENV_PATH
-    out = {"ok": False, "path": str(p), "error": "", "backup": ""}
+    out = {"ok": False, "path": str(p), "error": "", "backup": "", "quoted": False}
     if not env_key or not value:
         out["error"] = "env_key 或 Key 为空"
         return out
@@ -2424,7 +2452,9 @@ def install_codex_env_key(env_key: str, value: str, path: str | Path | None = No
         except Exception:
             pass
     kept = [ln for ln in lines if not ln.strip().startswith(f"{env_key}=")]
-    kept.append(f"{env_key}={value}")
+    encoded, quoted = _dotenv_value(value)
+    kept.append(f"{env_key}={encoded}")
+    out["quoted"] = quoted
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text("\n".join(kept).strip("\n") + "\n", encoding="utf-8")
@@ -2748,12 +2778,6 @@ def backend_from_channels(anthropic_ok: bool, openai_wire: str) -> str:
     if anthropic_ok:
         return "messages"
     return "chat_completions"
-
-
-def _toml_str(v) -> str:
-    """把字符串写成 TOML 基本字符串（转义反斜杠与引号）。"""
-    s = str(v)
-    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def _toml_key(k) -> str:
@@ -6626,6 +6650,58 @@ def selftest() -> int:
                   == "https://gw.example.com/v1")
     except ImportError:
         check("（Python<3.11 无 tomllib，跳过 TOML 解析校验）", True)
+
+    # [[数组表]] 不是普通表：表内的 model 是数据，不能被当成顶层键删掉；
+    # 删除同名 provider 表时也不能顺手把后面的数组表一起吃掉。
+    array_toml = ('model = "top"\n\n[[profiles]]\nname = "p1"\nmodel = "gpt-4o"\n\n'
+                  '[[profiles]]\nname = "p2"\nmodel = "o3"\n\n'
+                  '[model_providers.api_probe]\nbase_url = "https://old/v1"\n\n'
+                  '[desktop]\ntheme = "dark"\n')
+    merged5 = merge_codex_config(array_toml, "gpt-5.1-codex", "https://gw.example.com/v1",
+                                 "CODEX_API_KEY", "我的站点", "responses")
+    try:
+        import tomllib
+        parsed5 = tomllib.loads(merged5)
+        check("[[数组表]] 内的 model 键不被误删",
+              [p.get("model") for p in parsed5.get("profiles", [])] == ["gpt-4o", "o3"])
+        check("[[数组表]] 与后面的普通表都被保留",
+              "[desktop]" in merged5 and merged5.count("[[profiles]]") == 2)
+    except ImportError:
+        check("（Python<3.11 无 tomllib，跳过数组表校验）", True)
+    stripped = _strip_provider_table('[model_providers.api_probe]\nbase_url = "https://old/v1"\n\n'
+                                     '[[profiles]]\nname = "p1"\n\n[desktop]\ntheme = "dark"\n',
+                                     "api_probe")
+    check("删同名表时不会吃掉紧跟的 [[数组表]]",
+          "[[profiles]]" in stripped and "[desktop]" in stripped
+          and "https://old/v1" not in stripped)
+
+    # 网关返回的模型名是外部输入：必须能安全落成 TOML 字符串，且不能注入别的键。
+    weirds = ['gpt"x', 'a"\nsandbox_mode = "danger-full-access', "a\\b", "中文 模型"]
+    for w in weirds:
+        txt = merge_codex_config('approval_policy = "never"\n', w, "https://gw/v1",
+                                 "CODEX_API_KEY")
+        try:
+            import tomllib
+            parsed6 = tomllib.loads(txt)
+            ok = (parsed6.get("model") == w
+                  and parsed6.get("sandbox_mode") is None
+                  and parsed6.get("approval_policy") == "never")
+        except ImportError:
+            ok = True
+        except Exception:
+            ok = False
+        check(f"模型名 {w!r} 能原样回读且不注入其它键", ok)
+
+    with tempfile.TemporaryDirectory() as td:
+        ep = Path(td) / ".env"
+        ep.write_text("OTHER=1\n", encoding="utf-8")
+        r = install_codex_env_key("CODEX_API_KEY", "sk-a b#c", path=ep)
+        check("含 # 的 Key 会被加引号，值不会被当注释截断",
+              r["ok"] and r["quoted"] is True
+              and 'CODEX_API_KEY="sk-a b#c"' in ep.read_text(encoding="utf-8"))
+        r2 = install_codex_env_key("CODEX_API_KEY", "sk-normal-123", path=ep)
+        check("普通 Key 保持不加引号", r2["ok"] and r2["quoted"] is False
+              and "CODEX_API_KEY=sk-normal-123" in ep.read_text(encoding="utf-8"))
     try:
         import tomllib
         parsed = tomllib.loads(merged2)
